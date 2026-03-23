@@ -104,17 +104,17 @@ async function upsertTodayMatches(today: string): Promise<void> {
 // ─── Shared pipeline logic ────────────────────────────────────────────────────
 
 async function runPipeline(): Promise<NextResponse> {
-  const today = new Date().toISOString().split('T')[0]
+  // Force UTC date so it matches what the Odds API returns
+  const now = new Date()
+  const today = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`
 
   try {
-    console.log('[trigger-predictions] Step 1: fetching matches from Odds API…')
     await upsertTodayMatches(today)
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
     console.error('[trigger-predictions] Odds API fetch failed:', message)
   }
 
-  // Read with anon client — just a select
   const { data: matches, error: matchErr } = await supabase
     .from('matches')
     .select('*, leagues(name, country, avg_draw_rate, draw_boost)')

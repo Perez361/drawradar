@@ -92,14 +92,14 @@ export async function fetchOddsForSport(
  * Costs 1 request per league (up to 8 on free tier).
  * To stay within 500/month budget (~16/day) we fetch all 8 = 8 req/day = 240/month ✓
  */
-export async function fetchMatchesForDate(apiKey: string, dateFrom: string, dateTo: string): Promise<OddsApiEvent[]> {
-  const start = new Date(dateFrom)
-  start.setHours(0, 0, 0, 0)
-  const end   = new Date(dateTo)
-  end.setHours(23, 59, 59, 999)
-
-  const fromIso = start.toISOString()
-  const toIso   = end.toISOString()
+export async function fetchMatchesForDate(
+  apiKey: string,
+  dateFrom: string,
+  dateTo: string
+): Promise<OddsApiEvent[]> {
+  // Use UTC midnight to UTC 23:59 to avoid timezone drift
+  const fromIso = `${dateFrom}T00:00:00Z`
+  const toIso   = `${dateTo}T23:59:59Z`
 
   const results = await Promise.allSettled(
     Object.keys(SUPPORTED_SPORT_KEYS).map((key) =>

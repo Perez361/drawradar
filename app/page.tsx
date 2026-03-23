@@ -1,4 +1,4 @@
-export const revalidate = 0  // always fetch fresh from Supabase
+export const revalidate = 0
 
 import { supabase, impliedProbability } from '@/lib/supabase'
 import type { Prediction } from '@/lib/supabase'
@@ -60,8 +60,9 @@ function OddsBadge({ odds }: { odds: number }) {
 }
 
 export default async function HomePage() {
-  const today = new Date().toISOString().split('T')[0]
-  const formattedDate = new Date().toLocaleDateString('en-GB', {
+  const now = new Date()
+  const today = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`
+  const formattedDate = now.toLocaleDateString('en-GB', {
     weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
   })
 
@@ -74,7 +75,6 @@ export default async function HomePage() {
 
   const preds = (predictions ?? []) as Prediction[]
 
-  // Stats for header
   const avgConfidence = preds.length
     ? Math.round(preds.reduce((s, p) => s + p.confidence, 0) / preds.length)
     : 0
@@ -204,7 +204,6 @@ export default async function HomePage() {
                         {m.away_team_name}
                       </p>
 
-                      {/* Confidence bar */}
                       <div className="mt-2 flex items-center gap-3">
                         <div className="flex-1 max-w-xs">
                           <ConfidenceBar value={pred.confidence} />
