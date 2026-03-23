@@ -2,11 +2,12 @@ import { supabase, calculateDrawProbability, impliedProbability } from '@/lib/su
 import Link from 'next/link'
 import { notFound } from 'next/navigation'
 
-export default async function MatchPage({ params }: { params: { id: string } }) {
+export default async function MatchPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params
   const { data: match } = await supabase
     .from('matches')
     .select('*, leagues(name, country, avg_draw_rate, draw_boost)')
-    .eq('id', params.id)
+    .eq('id', id)
     .single()
 
   if (!match) notFound()
