@@ -1,0 +1,70 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --radar-green: #00ff87;
+  --radar-green-dim: #00c96a;
+  --radar-bg: #080d12;
+  --radar-surface: #0e1620;
+  --radar-surface-2: #141f2e;
+  --radar-border: rgba(255,255,255,0.07);
+  --radar-text: #e2e8f0;
+  --radar-muted: #6b7a8d;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background: var(--radar-bg);
+  color: var(--radar-text);
+  font-family: 'Inter', sans-serif;
+  min-height: 100vh;
+}
+
+/* Confidence bar */
+.confidence-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--radar-border);
+  overflow: hidden;
+}
+.confidence-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #00c96a, #00ff87);
+  transition: width 0.6s ease;
+}
+
+/* Radar pulse animation */
+@keyframes pulse-ring {
+  0% { transform: scale(0.8); opacity: 0.8; }
+  100% { transform: scale(2); opacity: 0; }
+}
+.radar-pulse::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--radar-green);
+  animation: pulse-ring 2s ease-out infinite;
+}
+
+/* Rank badge glow for top 3 */
+.rank-1 { color: #FFD700; text-shadow: 0 0 12px rgba(255,215,0,0.5); }
+.rank-2 { color: #C0C0C0; text-shadow: 0 0 8px rgba(192,192,192,0.4); }
+.rank-3 { color: #CD7F32; text-shadow: 0 0 8px rgba(205,127,50,0.4); }
+
+/* Card hover effect */
+.prediction-card {
+  transition: transform 0.2s ease, border-color 0.2s ease;
+}
+.prediction-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(0, 255, 135, 0.25) !important;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--radar-bg); }
+::-webkit-scrollbar-thumb { background: var(--radar-surface-2); border-radius: 3px; }
