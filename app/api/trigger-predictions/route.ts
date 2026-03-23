@@ -6,7 +6,7 @@ import {
   scoreToConfidence,
 } from '@/lib/supabase'
 import {
-  fetchMatchesForDate,
+  fetchTodayMatchesAllLeagues,
   mapEventToMatch,
   type MappedMatch,
 } from '@/lib/odds-api'
@@ -43,17 +43,17 @@ async function upsertLeague(
  * Uses external_id for idempotency so re-runs don't create duplicates.
  * Returns the inserted/updated match ids.
  */
-async function upsertMatches(targetDate: string): Promise<void> {
+async function upsertTodayMatches(today: string): Promise<void> {
   const apiKey = process.env.ODDS_API_KEY
   if (!apiKey) throw new Error('ODDS_API_KEY env var is not set')
 
-  const events    = await fetchMatchesForDate(apiKey, `${targetDate}T00:00:00Z`, `${targetDate}T23:59:59Z`)
+  const events    = await fetchTodayMatchesAllLeagues(apiKey)
   const mappedAll = events
     .map(mapEventToMatch)
     .filter((m): m is MappedMatch => m !== null)
 
   if (mappedAll.length === 0) {
-    console.log(`[upsertMatches] No events with odds found for ${targetDate}.`)
+    console.log('[upsertTodayMatches] No events with odds found for today.')
     return
   }
 
@@ -103,10 +103,10 @@ async function upsertMatches(targetDate: string): Promise<void> {
       .upsert(rows, { onConflict: 'external_id' })   // idempotent re-runs
 
     if (error) {
-    console.error(`[upsertMatches] league ${leagueName}:`, error.message)
-  } else {
-    console.log(`[upsertMatches] Upserted ${rows.length} matches for ${leagueName}`)
-  }
+      console.error(`[upsertTodayMatches] league ${leagueName}:`, error.message)
+    } else {
+      console.log(`[upsertTodayMatches] Upserted ${rows.length} matches for ${leagueName}`)
+    }
   }
 }
 
@@ -117,43 +117,32 @@ async function upsertMatches(targetDate: string): Promise<void> {
 //   2. Score every match with the draw algorithm
 //   3. Insert top 10 as predictions for today
 
-export async function POST(req: NextRequest) {
-  // ── Auth ──────────────────────────────────────────────────────────────────
-  const authHeader = req.headers.get('authorization')
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const { searchParams } = new URL(req.url)
-  const dateParam = searchParams.get('date')
-  const targetDate = dateParam || new Date().toISOString().split('T')[0]
+// Shared pipeline logic used by both POST (cron) and GET (local dev)
+async function runPipeline(): Promise<NextResponse> {
+  const today = new Date().toISOString().split('T')[0]
 
   try {
-    // ── Step 1: Fetch & upsert today's matches from The Odds API ─────────
-    console.log(`[trigger-predictions] Step 1: fetching matches for ${targetDate} from Odds API…`)
-    await upsertMatches(targetDate)
+    console.log('[trigger-predictions] Step 1: fetching matches from Odds API…')
+    await upsertTodayMatches(today)
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
     console.error('[trigger-predictions] Odds API fetch failed:', message)
-    // Don't abort — fall through to score whatever is already in the DB
   }
 
-  // ── Step 2: Load today's scheduled matches ────────────────────────────
   const { data: matches, error: matchErr } = await supabase
     .from('matches')
     .select('*, leagues(name, country, avg_draw_rate, draw_boost)')
-    .gte('match_date', `${targetDate}T00:00:00`)
-    .lte('match_date', `${targetDate}T23:59:59`)
+    .gte('match_date', `${today}T00:00:00`)
+    .lte('match_date', `${today}T23:59:59`)
     .eq('status', 'scheduled')
 
   if (matchErr || !matches || matches.length === 0) {
     return NextResponse.json(
-      { error: matchErr?.message ?? `No matches found for ${targetDate}` },
+      { error: matchErr?.message ?? 'No matches found for today' },
       { status: 500 }
     )
   }
 
-  // ── Step 3: Score every match ─────────────────────────────────────────
   const scored = matches.map((match) => {
     const drawScore       = calculateDrawScore(match as any)
     const drawProbability = calculateDrawProbability(match.xg_home, match.xg_away)
@@ -161,7 +150,6 @@ export async function POST(req: NextRequest) {
     return { ...match, draw_score: drawScore, draw_probability: drawProbability, confidence }
   })
 
-  // ── Step 4: Persist scores back to matches ────────────────────────────
   await Promise.all(
     scored.map((m) =>
       supabase
@@ -175,8 +163,7 @@ export async function POST(req: NextRequest) {
     )
   )
 
-  // ── Step 5: Re-insert top 10 predictions ─────────────────────────────
-  await supabase.from('predictions').delete().eq('prediction_date', targetDate)
+  await supabase.from('predictions').delete().eq('prediction_date', today)
 
   const top10 = [...scored]
     .sort((a, b) => b.draw_score - a.draw_score)
@@ -185,7 +172,7 @@ export async function POST(req: NextRequest) {
   const { error: insertErr } = await supabase.from('predictions').insert(
     top10.map((m, i) => ({
       match_id:         m.id,
-      prediction_date:  targetDate,
+      prediction_date:  today,
       rank:             i + 1,
       draw_score:       m.draw_score,
       draw_probability: m.draw_probability,
@@ -198,13 +185,33 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: insertErr.message }, { status: 500 })
   }
 
-    return NextResponse.json({
+  return NextResponse.json({
     success:     true,
-    date:        targetDate,
     fetched:     matches.length,
     predictions: top10.length,
     top_pick:    top10[0]
       ? `${top10[0].home_team_name} vs ${top10[0].away_team_name} (score: ${top10[0].draw_score})`
       : null,
   })
+}
+
+// ─── GET /api/trigger-predictions ────────────────────────────────────────────
+// Dev-only: allows triggering from the browser / admin page without CRON_SECRET
+export async function GET(req: NextRequest) {
+  if (process.env.NODE_ENV === 'production') {
+    return NextResponse.json({ error: 'Not available in production' }, { status: 403 })
+  }
+  return runPipeline()
+}
+
+// ─── POST /api/trigger-predictions ───────────────────────────────────────────
+// Called daily by Vercel Cron at 07:00 UTC (vercel.json).
+export async function POST(req: NextRequest) {
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  const authHeader = req.headers.get('authorization')
+  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  return runPipeline()
 }
