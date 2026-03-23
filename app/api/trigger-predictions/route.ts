@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
   supabase,
+  supabaseAdmin,
   calculateDrawScore,
   calculateDrawProbability,
   scoreToConfidence,
@@ -18,7 +19,7 @@ async function upsertLeague(
   country: string,
   avgDrawRate: number
 ): Promise<number | null> {
-  const { data, error } = await supabase
+  const { data, error } = await supabaseAdmin
     .from('leagues')
     .upsert(
       { name, country, avg_draw_rate: avgDrawRate, draw_boost: 0 },
@@ -38,7 +39,6 @@ async function upsertTodayMatches(today: string): Promise<void> {
   const apiKey = process.env.ODDS_API_KEY
   if (!apiKey) throw new Error('ODDS_API_KEY env var is not set')
 
-  // fetchMatchesForDate takes (apiKey, dateFrom, dateTo)
   const events = await fetchMatchesForDate(apiKey, today, today)
   const mappedAll = events
     .map(mapEventToMatch)
@@ -89,7 +89,7 @@ async function upsertTodayMatches(today: string): Promise<void> {
       external_id:      m.external_id,
     }))
 
-    const { error } = await supabase
+    const { error } = await supabaseAdmin
       .from('matches')
       .upsert(rows, { onConflict: 'external_id' })
 
@@ -112,9 +112,9 @@ async function runPipeline(): Promise<NextResponse> {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
     console.error('[trigger-predictions] Odds API fetch failed:', message)
-    // Continue — fall back to any matches already in DB for today
   }
 
+  // Read with anon client — just a select
   const { data: matches, error: matchErr } = await supabase
     .from('matches')
     .select('*, leagues(name, country, avg_draw_rate, draw_boost)')
@@ -136,9 +136,10 @@ async function runPipeline(): Promise<NextResponse> {
     return { ...match, draw_score: drawScore, draw_probability: drawProbability, confidence }
   })
 
+  // Writes — use admin client
   await Promise.all(
     scored.map((m) =>
-      supabase
+      supabaseAdmin
         .from('matches')
         .update({
           draw_score:       m.draw_score,
@@ -149,23 +150,28 @@ async function runPipeline(): Promise<NextResponse> {
     )
   )
 
-  await supabase.from('predictions').delete().eq('prediction_date', today)
+  await supabaseAdmin
+    .from('predictions')
+    .delete()
+    .eq('prediction_date', today)
 
   const top10 = [...scored]
     .sort((a, b) => b.draw_score - a.draw_score)
     .slice(0, 10)
 
-  const { error: insertErr } = await supabase.from('predictions').insert(
-    top10.map((m, i) => ({
-      match_id:         m.id,
-      prediction_date:  today,
-      rank:             i + 1,
-      draw_score:       m.draw_score,
-      draw_probability: m.draw_probability,
-      confidence:       m.confidence,
-      draw_odds:        m.draw_odds,
-    }))
-  )
+  const { error: insertErr } = await supabaseAdmin
+    .from('predictions')
+    .insert(
+      top10.map((m, i) => ({
+        match_id:         m.id,
+        prediction_date:  today,
+        rank:             i + 1,
+        draw_score:       m.draw_score,
+        draw_probability: m.draw_probability,
+        confidence:       m.confidence,
+        draw_odds:        m.draw_odds,
+      }))
+    )
 
   if (insertErr) {
     return NextResponse.json({ error: insertErr.message }, { status: 500 })

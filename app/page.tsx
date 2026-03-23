@@ -1,3 +1,5 @@
+export const revalidate = 0  // always fetch fresh from Supabase
+
 import { supabase, impliedProbability } from '@/lib/supabase'
 import type { Prediction } from '@/lib/supabase'
 import Link from 'next/link'

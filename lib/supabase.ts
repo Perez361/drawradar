@@ -2,8 +2,13 @@ import { createClient } from '@supabase/supabase-js'
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!
 
+// Public client — reads, frontend safe
 export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+
+// Admin client — bypasses RLS, server-side only, never expose to browser
+export const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey)
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -68,33 +73,26 @@ export function calculateDrawProbability(xgHome: number, xgAway: number): number
 export function calculateDrawScore(match: Match): number {
   let score = 0
 
-  // Team strength similarity (based on goals avg difference)
   const goalsDiff = Math.abs(match.home_goals_avg - match.away_goals_avg)
   if (goalsDiff < 0.3) score += 2
   else if (goalsDiff < 0.6) score += 1
 
-  // Low-scoring teams (under 1.5 goals avg each)
   if (match.home_goals_avg < 1.5 && match.away_goals_avg < 1.5) score += 2
   else if (match.home_goals_avg < 1.8 && match.away_goals_avg < 1.8) score += 1
 
-  // High draw rate for both teams
   if (match.home_draw_rate > 0.35 && match.away_draw_rate > 0.35) score += 2
   else if (match.home_draw_rate > 0.28 && match.away_draw_rate > 0.28) score += 1
 
-  // Head-to-head draw rate
   if (match.h2h_draw_rate > 0.38) score += 1
   else if (match.h2h_draw_rate > 0.28) score += 0.5
 
-  // Similar xG (evenly-matched attack)
   const xgDiff = Math.abs(match.xg_home - match.xg_away)
   if (xgDiff < 0.2) score += 1
   else if (xgDiff < 0.4) score += 0.5
 
-  // Draw odds in the sweet spot (2.80–3.60)
   if (match.draw_odds >= 2.8 && match.draw_odds <= 3.6) score += 2
   else if (match.draw_odds >= 3.6 && match.draw_odds <= 4.0) score += 1
 
-  // League draw bias bonus
   if (match.leagues?.draw_boost) score += match.leagues.draw_boost
 
   return Math.min(10, Math.round(score * 10) / 10)
