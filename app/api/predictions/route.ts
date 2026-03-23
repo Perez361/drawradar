@@ -14,7 +14,7 @@ export async function GET(request: Request) {
         leagues (name, country, avg_draw_rate, draw_boost)
       )
     `)
-    .eq('prediction_date', today)
+    .eq('prediction_date', date)
     .order('rank', { ascending: true })
     .limit(10)
 
