@@ -6,17 +6,13 @@ import {
   scoreToConfidence,
 } from '@/lib/supabase'
 import {
-  fetchTodayMatchesAllLeagues,
+  fetchMatchesForDate,
   mapEventToMatch,
   type MappedMatch,
 } from '@/lib/odds-api'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/**
- * Upsert a league row and return its id.
- * avg_draw_rate and draw_boost are seeded from the odds-api baseline data.
- */
 async function upsertLeague(
   name: string,
   country: string,
@@ -26,7 +22,7 @@ async function upsertLeague(
     .from('leagues')
     .upsert(
       { name, country, avg_draw_rate: avgDrawRate, draw_boost: 0 },
-      { onConflict: 'name' }           // assumes name is unique
+      { onConflict: 'name' }
     )
     .select('id')
     .single()
@@ -38,16 +34,12 @@ async function upsertLeague(
   return data.id
 }
 
-/**
- * Upsert today's match rows sourced from The Odds API.
- * Uses external_id for idempotency so re-runs don't create duplicates.
- * Returns the inserted/updated match ids.
- */
 async function upsertTodayMatches(today: string): Promise<void> {
   const apiKey = process.env.ODDS_API_KEY
   if (!apiKey) throw new Error('ODDS_API_KEY env var is not set')
 
-  const events    = await fetchTodayMatchesAllLeagues(apiKey)
+  // fetchMatchesForDate takes (apiKey, dateFrom, dateTo)
+  const events = await fetchMatchesForDate(apiKey, today, today)
   const mappedAll = events
     .map(mapEventToMatch)
     .filter((m): m is MappedMatch => m !== null)
@@ -57,7 +49,6 @@ async function upsertTodayMatches(today: string): Promise<void> {
     return
   }
 
-  // Group by league so we can upsert leagues first
   const byLeague = new Map<string, MappedMatch[]>()
   for (const m of mappedAll) {
     const key = m.league_name
@@ -72,35 +63,35 @@ async function upsertTodayMatches(today: string): Promise<void> {
     const leagueId = await upsertLeague(
       leagueName,
       first.league_country,
-      first.home_draw_rate  // use team draw rate as proxy for league avg
+      first.home_draw_rate
     )
     if (!leagueId) continue
 
     const rows = matches.map((m: MappedMatch) => ({
-      league_id:          leagueId,
-      home_team_name:     m.home_team_name,
-      away_team_name:     m.away_team_name,
-      match_date:         m.match_date,
-      draw_odds:          m.draw_odds,
-      xg_home:            m.xg_home,
-      xg_away:            m.xg_away,
-      home_goals_avg:     m.home_goals_avg,
-      away_goals_avg:     m.away_goals_avg,
-      home_concede_avg:   m.home_concede_avg,
-      away_concede_avg:   m.away_concede_avg,
-      home_draw_rate:     m.home_draw_rate,
-      away_draw_rate:     m.away_draw_rate,
-      h2h_draw_rate:      m.h2h_draw_rate,
-      draw_score:         0,
-      draw_probability:   0,
-      confidence:         0,
-      status:             'scheduled',
-      external_id:        m.external_id,
+      league_id:        leagueId,
+      home_team_name:   m.home_team_name,
+      away_team_name:   m.away_team_name,
+      match_date:       m.match_date,
+      draw_odds:        m.draw_odds,
+      xg_home:          m.xg_home,
+      xg_away:          m.xg_away,
+      home_goals_avg:   m.home_goals_avg,
+      away_goals_avg:   m.away_goals_avg,
+      home_concede_avg: m.home_concede_avg,
+      away_concede_avg: m.away_concede_avg,
+      home_draw_rate:   m.home_draw_rate,
+      away_draw_rate:   m.away_draw_rate,
+      h2h_draw_rate:    m.h2h_draw_rate,
+      draw_score:       0,
+      draw_probability: 0,
+      confidence:       0,
+      status:           'scheduled',
+      external_id:      m.external_id,
     }))
 
     const { error } = await supabase
       .from('matches')
-      .upsert(rows, { onConflict: 'external_id' })   // idempotent re-runs
+      .upsert(rows, { onConflict: 'external_id' })
 
     if (error) {
       console.error(`[upsertTodayMatches] league ${leagueName}:`, error.message)
@@ -110,14 +101,8 @@ async function upsertTodayMatches(today: string): Promise<void> {
   }
 }
 
-// ─── POST /api/trigger-predictions ───────────────────────────────────────────
-// Called daily by Vercel Cron at 07:00 UTC (vercel.json).
-// Flow:
-//   1. Fetch today's matches + odds from The Odds API → upsert into matches table
-//   2. Score every match with the draw algorithm
-//   3. Insert top 10 as predictions for today
+// ─── Shared pipeline logic ────────────────────────────────────────────────────
 
-// Shared pipeline logic used by both POST (cron) and GET (local dev)
 async function runPipeline(): Promise<NextResponse> {
   const today = new Date().toISOString().split('T')[0]
 
@@ -127,6 +112,7 @@ async function runPipeline(): Promise<NextResponse> {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
     console.error('[trigger-predictions] Odds API fetch failed:', message)
+    // Continue — fall back to any matches already in DB for today
   }
 
   const { data: matches, error: matchErr } = await supabase
@@ -195,8 +181,8 @@ async function runPipeline(): Promise<NextResponse> {
   })
 }
 
-// ─── GET /api/trigger-predictions ────────────────────────────────────────────
-// Dev-only: allows triggering from the browser / admin page without CRON_SECRET
+// ─── GET /api/trigger-predictions — dev only ─────────────────────────────────
+
 export async function GET(req: NextRequest) {
   if (process.env.NODE_ENV === 'production') {
     return NextResponse.json({ error: 'Not available in production' }, { status: 403 })
@@ -204,14 +190,12 @@ export async function GET(req: NextRequest) {
   return runPipeline()
 }
 
-// ─── POST /api/trigger-predictions ───────────────────────────────────────────
-// Called daily by Vercel Cron at 07:00 UTC (vercel.json).
+// ─── POST /api/trigger-predictions — Vercel Cron ─────────────────────────────
+
 export async function POST(req: NextRequest) {
-  // ── Auth ──────────────────────────────────────────────────────────────────
   const authHeader = req.headers.get('authorization')
   if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-
   return runPipeline()
 }
