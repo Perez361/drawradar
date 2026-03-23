@@ -5,42 +5,176 @@ import type { Prediction } from '@/lib/supabase'
 import Link from 'next/link'
 
 const LEAGUE_FLAGS: Record<string, string> = {
-  'Premier League':        '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'La Liga':               '🇪🇸',
-  'Serie A':               '🇮🇹',
-  'Bundesliga':            '🇩🇪',
-  'Ligue 1':               '🇫🇷',
-  'Eredivisie':            '🇳🇱',
-  'Primeira Liga':         '🇵🇹',
-  'Super Lig':             '🇹🇷',
-  'Pro League':            '🇧🇪',
-  'Scottish Premiership':  '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
-  'Super League':          '🇬🇷',
-  'Allsvenskan':           '🇸🇪',
-  'Eliteserien':           '🇳🇴',
-  'Superliga':             '🇩🇰',
-  'Ekstraklasa':           '🇵🇱',
-  'Czech First League':    '🇨🇿',
-  'SuperLiga':             '🇷🇸',
-  'Liga 1':                '🇷🇴',
-  'HNL':                   '🇭🇷',
-  'Championship':          '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'League One':            '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'League Two':            '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'Bundesliga 2':          '🇩🇪',
-  'Segunda División':      '🇪🇸',
-  'Serie B':               '🇮🇹',
-  'Ligue 2':               '🇫🇷',
-  'Brasileirão':           '🇧🇷',
-  'Primera División':      '🇦🇷',
-  'Liga MX':               '🇲🇽',
-  'MLS':                   '🇺🇸',
-  'Primera División Chile':'🇨🇱',
-  'Categoría Primera A':   '🇨🇴',
-  'J1 League':             '🇯🇵',
-  'K League 1':            '🇰🇷',
-  'Saudi Pro League':      '🇸🇦',
-  'A-League':              '🇦🇺',
+  // England
+  'Premier League':             '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'Championship':               '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'League One':                 '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'League Two':                 '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'National League':            '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+
+  // Spain
+  'La Liga':                    '🇪🇸',
+  'Segunda División':           '🇪🇸',
+  'Primera RFEF':               '🇪🇸',
+
+  // Italy
+  'Serie A':                    '🇮🇹',
+  'Serie B':                    '🇮🇹',
+  'Serie C':                    '🇮🇹',
+
+  // Germany
+  'Bundesliga':                 '🇩🇪',
+  'Bundesliga 2':               '🇩🇪',
+  '3. Liga':                    '🇩🇪',
+
+  // France
+  'Ligue 1':                    '🇫🇷',
+  'Ligue 2':                    '🇫🇷',
+  'National 1':                 '🇫🇷',
+
+  // Netherlands
+  'Eredivisie':                 '🇳🇱',
+  'Eerste Divisie':             '🇳🇱',
+
+  // Portugal
+  'Primeira Liga':              '🇵🇹',
+  'Liga Portugal 2':            '🇵🇹',
+
+  // Turkey
+  'Super Lig':                  '🇹🇷',
+  'TFF 1. Lig':                 '🇹🇷',
+
+  // Belgium
+  'Pro League':                 '🇧🇪',
+  'Challenger Pro League':      '🇧🇪',
+
+  // Scotland
+  'Scottish Premiership':       '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
+
+  // Greece
+  'Super League':               '🇬🇷',
+  'Super League 2':             '🇬🇷',
+
+  // Sweden
+  'Allsvenskan':                '🇸🇪',
+  'Superettan':                 '🇸🇪',
+
+  // Norway
+  'Eliteserien':                '🇳🇴',
+  'First Division':             '🇳🇴',
+
+  // Denmark
+  'Superliga':                  '🇩🇰',
+  '1st Division':               '🇩🇰',
+
+  // Poland
+  'Ekstraklasa':                '🇵🇱',
+  'I Liga':                     '🇵🇱',
+
+  // Czech Republic
+  'Czech First League':         '🇨🇿',
+  'FNL':                        '🇨🇿',
+
+  // Serbia
+  'SuperLiga':                  '🇷🇸',
+  'First League':               '🇷🇸',
+
+  // Romania
+  'Liga 1':                     '🇷🇴',
+  'Liga 2':                     '🇷🇴',
+
+  // Croatia
+  'HNL':                        '🇭🇷',
+  'HNL 2':                      '🇭🇷',
+
+  // Africa
+  'NPFL':                       '🇳🇬',
+  'Egyptian Premier League':    '🇪🇬',
+  'Ligue Professionnelle 1':    '🌍',
+  'Botola Pro':                 '🇲🇦',
+  'Premier Soccer League':      '🇿🇦',
+  'Ghana Premier League':       '🇬🇭',
+
+  // Americas
+  'Brasileirão':                '🇧🇷',
+  'Serie D':                    '🇧🇷',
+  'Primera División':           '⚽',   // shared by many countries — fallback
+  'Primera Nacional':           '🇦🇷',
+  'Torneo Federal A':           '🇦🇷',
+  'Liga MX':                    '🇲🇽',
+  'MLS':                        '🇺🇸',
+  'Primera B':                  '🇨🇱',
+  'Categoría Primera A':        '🇨🇴',
+  'Categoría Primera B':        '🇨🇴',
+  'LigaPro':                    '🇪🇨',
+  'División Profesional':       '⚽',   // shared by Bolivia/Paraguay
+  'Saudi Pro League':           '🇸🇦',
+  'A-League':                   '🇦🇺',
+  'J1 League':                  '🇯🇵',
+  'K League 1':                 '🇰🇷',
+  'Indian Super League':        '🇮🇳',
+  'I-League':                   '🇮🇳',
+  'Chinese Super League':       '🇨🇳',
+  'Persian Gulf Pro League':    '🇮🇷',
+  'UAE Pro League':             '🇦🇪',
+}
+
+// Country-aware flag lookup — used to disambiguate leagues with shared names
+const COUNTRY_FLAGS: Record<string, string> = {
+  'England':        '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'Scotland':       '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
+  'Spain':          '🇪🇸',
+  'Italy':          '🇮🇹',
+  'Germany':        '🇩🇪',
+  'France':         '🇫🇷',
+  'Netherlands':    '🇳🇱',
+  'Portugal':       '🇵🇹',
+  'Turkey':         '🇹🇷',
+  'Belgium':        '🇧🇪',
+  'Greece':         '🇬🇷',
+  'Sweden':         '🇸🇪',
+  'Norway':         '🇳🇴',
+  'Denmark':        '🇩🇰',
+  'Poland':         '🇵🇱',
+  'Czech Republic': '🇨🇿',
+  'Serbia':         '🇷🇸',
+  'Romania':        '🇷🇴',
+  'Croatia':        '🇭🇷',
+  'Nigeria':        '🇳🇬',
+  'Egypt':          '🇪🇬',
+  'Tunisia':        '🇹🇳',
+  'Algeria':        '🇩🇿',
+  'Morocco':        '🇲🇦',
+  'South Africa':   '🇿🇦',
+  'Ghana':          '🇬🇭',
+  'Kenya':          '🇰🇪',
+  'Brazil':         '🇧🇷',
+  'Argentina':      '🇦🇷',
+  'Mexico':         '🇲🇽',
+  'USA':            '🇺🇸',
+  'Chile':          '🇨🇱',
+  'Colombia':       '🇨🇴',
+  'Ecuador':        '🇪🇨',
+  'Uruguay':        '🇺🇾',
+  'Venezuela':      '🇻🇪',
+  'Bolivia':        '🇧🇴',
+  'Paraguay':       '🇵🇾',
+  'Saudi Arabia':   '🇸🇦',
+  'UAE':            '🇦🇪',
+  'Iran':           '🇮🇷',
+  'Iraq':           '🇮🇶',
+  'Lebanon':        '🇱🇧',
+  'Jordan':         '🇯🇴',
+  'Japan':          '🇯🇵',
+  'South Korea':    '🇰🇷',
+  'India':          '🇮🇳',
+  'China':          '🇨🇳',
+  'Australia':      '🇦🇺',
+}
+
+function getLeagueFlag(leagueName: string, country: string): string {
+  // Country-first lookup is more precise for shared league names
+  return COUNTRY_FLAGS[country] ?? LEAGUE_FLAGS[leagueName] ?? '⚽'
 }
 
 function ConfidenceBar({ value }: { value: number }) {
@@ -152,9 +286,9 @@ export default async function HomePage() {
 
           <div className="grid grid-cols-3 gap-4 mb-10">
             {[
-              { label: 'Matches analysed', value: preds.length.toString() },
-              { label: 'Avg confidence',   value: `${avgConfidence}%` },
-              { label: 'Top pick confidence', value: `${topConfidence}%` },
+              { label: 'Matches analysed',       value: preds.length.toString() },
+              { label: 'Avg confidence',          value: `${avgConfidence}%` },
+              { label: 'Top pick confidence',     value: `${topConfidence}%` },
             ].map((stat) => (
               <div
                 key={stat.label}
@@ -183,7 +317,7 @@ export default async function HomePage() {
             {preds.map((pred) => {
               const m      = pred.matches
               const league = m.leagues
-              const flag   = LEAGUE_FLAGS[league?.name ?? ''] ?? '⚽'
+              const flag   = getLeagueFlag(league?.name ?? '', league?.country ?? '')
               const isTop3 = pred.rank <= 3
 
               return (
@@ -209,6 +343,7 @@ export default async function HomePage() {
                           style={{ background: 'rgba(255,255,255,0.06)', color: 'var(--radar-muted)' }}
                         >
                           {league?.name}
+                          {league?.country ? ` · ${league.country}` : ''}
                         </span>
                         <span className="text-xs" style={{ color: 'var(--radar-muted)' }}>
                           {new Date(m.match_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
