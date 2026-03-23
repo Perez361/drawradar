@@ -7,10 +7,12 @@ import {
   scoreToConfidence,
 } from '@/lib/supabase'
 import {
-  fetchMatchesForDate,
-  mapEventToMatch,
-  type MappedMatch,
-} from '@/lib/odds-api'
+  fetchFixturesForDate,
+  fetchOddsForFixture,
+  mapFixture,
+  LEAGUE_ID_TO_INFO,
+  type MappedFixture,
+} from '@/lib/api-football'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -35,39 +37,68 @@ async function upsertLeague(
   return data.id
 }
 
-async function upsertTodayMatches(today: string): Promise<void> {
-  const apiKey = process.env.ODDS_API_KEY
-  if (!apiKey) throw new Error('ODDS_API_KEY env var is not set')
+async function upsertTodayMatches(today: string): Promise<number> {
+  const apiKey = process.env.API_FOOTBALL_KEY
+  if (!apiKey) throw new Error('API_FOOTBALL_KEY env var is not set')
 
-  const events = await fetchMatchesForDate(apiKey, today, today)
-  const mappedAll = events
-    .map(mapEventToMatch)
-    .filter((m): m is MappedMatch => m !== null)
+  console.log(`[pipeline] Fetching fixtures for ${today} from API-Football…`)
 
-  if (mappedAll.length === 0) {
-    console.log('[upsertTodayMatches] No events with odds found for today.')
-    return
-  }
+  // Single request fetches ALL leagues for the date
+  const fixtures = await fetchFixturesForDate(apiKey, today)
+  console.log(`[pipeline] Got ${fixtures.length} total fixtures from API-Football`)
 
-  const byLeague = new Map<string, MappedMatch[]>()
-  for (const m of mappedAll) {
-    const key = m.league_name
+  // Filter to only our tracked leagues
+  const tracked = fixtures.filter(f => LEAGUE_ID_TO_INFO[f.league.id])
+  console.log(`[pipeline] ${tracked.length} fixtures in tracked leagues`)
+
+  if (tracked.length === 0) return 0
+
+  // Fetch odds for each fixture (batched, respects rate limits)
+  // On free tier: 100 req/day. We use 1 for fixtures + up to 99 for odds.
+  // Limit to 50 fixtures for odds to be safe, rest get fallback odds.
+  const withOdds = await Promise.all(
+    tracked.slice(0, 50).map(async (fixture) => {
+      const drawOdds = await fetchOddsForFixture(apiKey, fixture.fixture.id)
+      return { fixture, drawOdds }
+    })
+  )
+
+  // Map remaining fixtures with fallback odds
+  const remaining = tracked.slice(50).map(fixture => ({ fixture, drawOdds: 3.2 }))
+  const all = [...withOdds, ...remaining]
+
+  // Map and filter
+  const mapped = all
+    .map(({ fixture, drawOdds }) => mapFixture(fixture, drawOdds))
+    .filter((m): m is MappedFixture => m !== null)
+
+  console.log(`[pipeline] ${mapped.length} valid mapped fixtures`)
+
+  // Group by league and upsert
+  const byLeague = new Map<string, MappedFixture[]>()
+  for (const m of mapped) {
+    const key = `${m.league_name}:${m.league_country}`
     if (!byLeague.has(key)) byLeague.set(key, [])
     byLeague.get(key)!.push(m)
   }
 
-  for (const [leagueName, matches] of Array.from(byLeague)) {
+  let totalUpserted = 0
+
+  for (const [, matches] of Array.from(byLeague)) {
     const first = matches[0]
     if (!first) continue
 
+    const leagueInfo = LEAGUE_ID_TO_INFO[first.league_id_ext]
+    if (!leagueInfo) continue
+
     const leagueId = await upsertLeague(
-      leagueName,
+      first.league_name,
       first.league_country,
-      first.home_draw_rate
+      leagueInfo.avgDrawRate
     )
     if (!leagueId) continue
 
-    const rows = matches.map((m: MappedMatch) => ({
+    const rows = matches.map((m) => ({
       league_id:        leagueId,
       home_team_name:   m.home_team_name,
       away_team_name:   m.away_team_name,
@@ -94,25 +125,29 @@ async function upsertTodayMatches(today: string): Promise<void> {
       .upsert(rows, { onConflict: 'external_id' })
 
     if (error) {
-      console.error(`[upsertTodayMatches] league ${leagueName}:`, error.message)
+      console.error(`[pipeline] upsert error for ${first.league_name}:`, error.message)
     } else {
-      console.log(`[upsertTodayMatches] Upserted ${rows.length} matches for ${leagueName}`)
+      console.log(`[pipeline] Upserted ${rows.length} matches for ${first.league_name}`)
+      totalUpserted += rows.length
     }
   }
+
+  return totalUpserted
 }
 
 // ─── Shared pipeline logic ────────────────────────────────────────────────────
 
 async function runPipeline(): Promise<NextResponse> {
-  // Force UTC date so it matches what the Odds API returns
   const now = new Date()
   const today = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`
 
+  let fetched = 0
+
   try {
-    await upsertTodayMatches(today)
+    fetched = await upsertTodayMatches(today)
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
-    console.error('[trigger-predictions] Odds API fetch failed:', message)
+    console.error('[pipeline] fetch failed:', message)
   }
 
   const { data: matches, error: matchErr } = await supabase
@@ -136,7 +171,6 @@ async function runPipeline(): Promise<NextResponse> {
     return { ...match, draw_score: drawScore, draw_probability: drawProbability, confidence }
   })
 
-  // Writes — use admin client
   await Promise.all(
     scored.map((m) =>
       supabaseAdmin
@@ -179,7 +213,7 @@ async function runPipeline(): Promise<NextResponse> {
 
   return NextResponse.json({
     success:     true,
-    fetched:     matches.length,
+    fetched:     fetched,
     predictions: top10.length,
     top_pick:    top10[0]
       ? `${top10[0].home_team_name} vs ${top10[0].away_team_name} (score: ${top10[0].draw_score})`
@@ -187,7 +221,7 @@ async function runPipeline(): Promise<NextResponse> {
   })
 }
 
-// ─── GET /api/trigger-predictions — dev only ─────────────────────────────────
+// ─── GET — dev only ───────────────────────────────────────────────────────────
 
 export async function GET(req: NextRequest) {
   if (process.env.NODE_ENV === 'production') {
@@ -196,7 +230,7 @@ export async function GET(req: NextRequest) {
   return runPipeline()
 }
 
-// ─── POST /api/trigger-predictions — Vercel Cron ─────────────────────────────
+// ─── POST — Vercel Cron ───────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
   const authHeader = req.headers.get('authorization')

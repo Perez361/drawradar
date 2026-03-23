@@ -5,14 +5,42 @@ import type { Prediction } from '@/lib/supabase'
 import Link from 'next/link'
 
 const LEAGUE_FLAGS: Record<string, string> = {
-  'Serie A': '🇮🇹',
-  'Ligue 1': '🇫🇷',
-  'La Liga': '🇪🇸',
-  'Bundesliga': '🇩🇪',
-  'Premier League': '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'Eredivisie': '🇳🇱',
-  'Primeira Liga': '🇵🇹',
-  'Super Lig': '🇹🇷',
+  'Premier League':        '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'La Liga':               '🇪🇸',
+  'Serie A':               '🇮🇹',
+  'Bundesliga':            '🇩🇪',
+  'Ligue 1':               '🇫🇷',
+  'Eredivisie':            '🇳🇱',
+  'Primeira Liga':         '🇵🇹',
+  'Super Lig':             '🇹🇷',
+  'Pro League':            '🇧🇪',
+  'Scottish Premiership':  '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
+  'Super League':          '🇬🇷',
+  'Allsvenskan':           '🇸🇪',
+  'Eliteserien':           '🇳🇴',
+  'Superliga':             '🇩🇰',
+  'Ekstraklasa':           '🇵🇱',
+  'Czech First League':    '🇨🇿',
+  'SuperLiga':             '🇷🇸',
+  'Liga 1':                '🇷🇴',
+  'HNL':                   '🇭🇷',
+  'Championship':          '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'League One':            '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'League Two':            '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'Bundesliga 2':          '🇩🇪',
+  'Segunda División':      '🇪🇸',
+  'Serie B':               '🇮🇹',
+  'Ligue 2':               '🇫🇷',
+  'Brasileirão':           '🇧🇷',
+  'Primera División':      '🇦🇷',
+  'Liga MX':               '🇲🇽',
+  'MLS':                   '🇺🇸',
+  'Primera División Chile':'🇨🇱',
+  'Categoría Primera A':   '🇨🇴',
+  'J1 League':             '🇯🇵',
+  'K League 1':            '🇰🇷',
+  'Saudi Pro League':      '🇸🇦',
+  'A-League':              '🇦🇺',
 }
 
 function ConfidenceBar({ value }: { value: number }) {
@@ -22,21 +50,14 @@ function ConfidenceBar({ value }: { value: number }) {
     '#ef4444'
   return (
     <div className="confidence-bar w-full mt-1">
-      <div
-        className="confidence-bar-fill"
-        style={{ width: `${value}%`, background: color }}
-      />
+      <div className="confidence-bar-fill" style={{ width: `${value}%`, background: color }} />
     </div>
   )
 }
 
 function RankBadge({ rank }: { rank: number }) {
   const cls = rank <= 3 ? `rank-${rank}` : 'text-gray-400'
-  return (
-    <span className={`text-2xl font-bold tabular-nums ${cls}`}>
-      #{rank}
-    </span>
-  )
+  return <span className={`text-2xl font-bold tabular-nums ${cls}`}>#{rank}</span>
 }
 
 function OddsBadge({ odds }: { odds: number }) {
@@ -82,7 +103,6 @@ export default async function HomePage() {
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--radar-bg)' }}>
-      {/* ── Header ── */}
       <header
         className="border-b px-6 py-4 flex items-center justify-between"
         style={{ borderColor: 'var(--radar-border)', background: 'var(--radar-surface)' }}
@@ -123,7 +143,6 @@ export default async function HomePage() {
       </header>
 
       <main className="max-w-5xl mx-auto px-4 py-10">
-        {/* ── Hero stats ── */}
         <div className="mb-10">
           <p className="text-sm mb-1" style={{ color: 'var(--radar-muted)' }}>{formattedDate}</p>
           <h2 className="text-3xl font-bold mb-2 tracking-tight">Today's Top Draw Predictions</h2>
@@ -134,7 +153,7 @@ export default async function HomePage() {
           <div className="grid grid-cols-3 gap-4 mb-10">
             {[
               { label: 'Matches analysed', value: preds.length.toString() },
-              { label: 'Avg confidence', value: `${avgConfidence}%` },
+              { label: 'Avg confidence',   value: `${avgConfidence}%` },
               { label: 'Top pick confidence', value: `${topConfidence}%` },
             ].map((stat) => (
               <div
@@ -149,7 +168,6 @@ export default async function HomePage() {
           </div>
         </div>
 
-        {/* ── Prediction cards ── */}
         {preds.length === 0 ? (
           <div
             className="rounded-xl p-12 text-center"
@@ -163,9 +181,9 @@ export default async function HomePage() {
         ) : (
           <div className="flex flex-col gap-3">
             {preds.map((pred) => {
-              const m = pred.matches
+              const m      = pred.matches
               const league = m.leagues
-              const flag = LEAGUE_FLAGS[league?.name ?? ''] ?? '⚽'
+              const flag   = LEAGUE_FLAGS[league?.name ?? ''] ?? '⚽'
               const isTop3 = pred.rank <= 3
 
               return (
@@ -179,19 +197,17 @@ export default async function HomePage() {
                   }}
                 >
                   <div className="flex items-center gap-4">
-                    {/* Rank */}
                     <div className="w-10 text-center flex-shrink-0">
                       <RankBadge rank={pred.rank} />
                     </div>
 
-                    {/* Match info */}
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-1">
                         <span className="text-sm">{flag}</span>
-                        <span className="text-xs px-2 py-0.5 rounded" style={{
-                          background: 'rgba(255,255,255,0.06)',
-                          color: 'var(--radar-muted)',
-                        }}>
+                        <span
+                          className="text-xs px-2 py-0.5 rounded"
+                          style={{ background: 'rgba(255,255,255,0.06)', color: 'var(--radar-muted)' }}
+                        >
                           {league?.name}
                         </span>
                         <span className="text-xs" style={{ color: 'var(--radar-muted)' }}>
@@ -203,7 +219,6 @@ export default async function HomePage() {
                         <span style={{ color: 'var(--radar-muted)' }}> vs </span>
                         {m.away_team_name}
                       </p>
-
                       <div className="mt-2 flex items-center gap-3">
                         <div className="flex-1 max-w-xs">
                           <ConfidenceBar value={pred.confidence} />
@@ -214,7 +229,6 @@ export default async function HomePage() {
                       </div>
                     </div>
 
-                    {/* Score + odds */}
                     <div className="flex flex-col items-end gap-2 flex-shrink-0">
                       <OddsBadge odds={pred.draw_odds} />
                       <div className="flex items-center gap-1">
@@ -234,7 +248,6 @@ export default async function HomePage() {
           </div>
         )}
 
-        {/* ── Algorithm explainer ── */}
         <div
           className="mt-12 rounded-xl p-6"
           style={{ background: 'var(--radar-surface)', border: '1px solid var(--radar-border)' }}
@@ -244,12 +257,12 @@ export default async function HomePage() {
           </h3>
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
             {[
-              { label: 'Team strength parity', pts: '2pts' },
-              { label: 'Low-scoring tendency', pts: '2pts' },
-              { label: 'Historical draw rate', pts: '2pts' },
-              { label: 'Draw odds sweet spot', pts: '2pts' },
-              { label: 'H2H draw history', pts: '1pt' },
-              { label: 'xG balance', pts: '1pt' },
+              { label: 'Team strength parity',  pts: '2pts' },
+              { label: 'Low-scoring tendency',  pts: '2pts' },
+              { label: 'Historical draw rate',  pts: '2pts' },
+              { label: 'Draw odds sweet spot',  pts: '2pts' },
+              { label: 'H2H draw history',      pts: '1pt'  },
+              { label: 'xG balance',            pts: '1pt'  },
             ].map((item) => (
               <div key={item.label} className="flex items-center justify-between">
                 <span className="text-sm" style={{ color: 'var(--radar-muted)' }}>{item.label}</span>
