@@ -9,10 +9,15 @@ import {
 import {
   fetchFixturesForDate,
   fetchOddsForFixture,
-  mapFixture,
+  mapFixtureWithStats,
   LEAGUE_ID_TO_INFO,
   type MappedFixture,
 } from '@/lib/api-football'
+import {
+  getTeamStatsBatch,
+  cacheKey,
+  currentSeason,
+} from '@/lib/team-stats-cache'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -41,40 +46,67 @@ async function upsertTodayMatches(today: string): Promise<number> {
   const apiKey = process.env.API_FOOTBALL_KEY
   if (!apiKey) throw new Error('API_FOOTBALL_KEY env var is not set')
 
-  console.log(`[pipeline] Fetching fixtures for ${today} from API-Football…`)
-
-  // Single request fetches ALL leagues for the date
+  // ── 1. Fetch all fixtures for the day (1 API call) ────────────────────────
+  console.log(`[pipeline] Fetching fixtures for ${today}…`)
   const fixtures = await fetchFixturesForDate(apiKey, today)
-  console.log(`[pipeline] Got ${fixtures.length} total fixtures from API-Football`)
+  console.log(`[pipeline] ${fixtures.length} total fixtures from API-Football`)
 
-  // Filter to only our tracked leagues
   const tracked = fixtures.filter(f => LEAGUE_ID_TO_INFO[f.league.id])
-  console.log(`[pipeline] ${tracked.length} fixtures in tracked leagues`)
-
+  console.log(`[pipeline] ${tracked.length} in tracked leagues`)
   if (tracked.length === 0) return 0
 
-  // Fetch odds for each fixture (batched, respects rate limits)
-  // On free tier: 100 req/day. We use 1 for fixtures + up to 99 for odds.
-  // Limit to 50 fixtures for odds to be safe, rest get fallback odds.
+  // ── 2. Fetch odds for up to 50 fixtures (≤50 API calls) ──────────────────
   const withOdds = await Promise.all(
-    tracked.slice(0, 50).map(async (fixture) => {
-      const drawOdds = await fetchOddsForFixture(apiKey, fixture.fixture.id)
-      return { fixture, drawOdds }
-    })
+    tracked.slice(0, 50).map(async (fixture) => ({
+      fixture,
+      drawOdds: await fetchOddsForFixture(apiKey, fixture.fixture.id),
+    }))
   )
 
-  // Map remaining fixtures with fallback odds
-  const remaining = tracked.slice(50).map(fixture => ({ fixture, drawOdds: 3.2 }))
-  const all = [...withOdds, ...remaining]
+  // Fixtures beyond the 50 cap are dropped — no real odds = no signal
+  const fixturesWithOdds = withOdds.filter(({ drawOdds }) => drawOdds > 0)
+  console.log(
+    `[pipeline] ${fixturesWithOdds.length}/${withOdds.length} fixtures have real odds`
+  )
 
-  // Map and filter
-  const mapped = all
-    .map(({ fixture, drawOdds }) => mapFixture(fixture, drawOdds))
+  // ── 3. Collect unique (teamId, leagueId) pairs ───────────────────────────
+  const season = currentSeason()
+  const seenPairs = new Set<string>()
+  const teamStatsPairs: Array<{ teamId: number; leagueId: number; season: number }> = []
+
+  for (const { fixture } of fixturesWithOdds) {
+    for (const teamId of [fixture.teams.home.id, fixture.teams.away.id]) {
+      const key = cacheKey(teamId, fixture.league.id, season)
+      if (!seenPairs.has(key)) {
+        seenPairs.add(key)
+        teamStatsPairs.push({ teamId, leagueId: fixture.league.id, season })
+      }
+    }
+  }
+
+  // ── 4. Fetch team stats — cache-first, ≤45 API calls ─────────────────────
+  // Budget: 1 (fixtures) + ≤50 (odds) + ≤45 (team stats) = ≤96/100
+  console.log(`[pipeline] Fetching stats for ${teamStatsPairs.length} team/league pairs…`)
+  const statsMap = await getTeamStatsBatch(apiKey, teamStatsPairs, 45)
+  console.log(`[pipeline] ${statsMap.size} teams resolved`)
+
+  // ── 5. Map fixtures to DB rows using real stats where available ───────────
+  const mapped = fixturesWithOdds
+    .map(({ fixture, drawOdds }) => {
+      const homeKey = cacheKey(fixture.teams.home.id, fixture.league.id, season)
+      const awayKey = cacheKey(fixture.teams.away.id, fixture.league.id, season)
+      return mapFixtureWithStats(
+        fixture,
+        drawOdds,
+        statsMap.get(homeKey) ?? null,
+        statsMap.get(awayKey) ?? null
+      )
+    })
     .filter((m): m is MappedFixture => m !== null)
 
   console.log(`[pipeline] ${mapped.length} valid mapped fixtures`)
 
-  // Group by league and upsert
+  // ── 6. Group by league and upsert ────────────────────────────────────────
   const byLeague = new Map<string, MappedFixture[]>()
   for (const m of mapped) {
     const key = `${m.league_name}:${m.league_country}`
@@ -99,25 +131,29 @@ async function upsertTodayMatches(today: string): Promise<number> {
     if (!leagueId) continue
 
     const rows = matches.map((m) => ({
-      league_id:        leagueId,
-      home_team_name:   m.home_team_name,
-      away_team_name:   m.away_team_name,
-      match_date:       m.match_date,
-      draw_odds:        m.draw_odds,
-      xg_home:          m.xg_home,
-      xg_away:          m.xg_away,
-      home_goals_avg:   m.home_goals_avg,
-      away_goals_avg:   m.away_goals_avg,
-      home_concede_avg: m.home_concede_avg,
-      away_concede_avg: m.away_concede_avg,
-      home_draw_rate:   m.home_draw_rate,
-      away_draw_rate:   m.away_draw_rate,
-      h2h_draw_rate:    m.h2h_draw_rate,
-      draw_score:       0,
-      draw_probability: 0,
-      confidence:       0,
-      status:           'scheduled',
-      external_id:      m.external_id,
+      league_id:            leagueId,
+      home_team_name:       m.home_team_name,
+      away_team_name:       m.away_team_name,
+      match_date:           m.match_date,
+      draw_odds:            m.draw_odds,
+      xg_home:              m.xg_home,
+      xg_away:              m.xg_away,
+      home_goals_avg:       m.home_goals_avg,
+      away_goals_avg:       m.away_goals_avg,
+      home_concede_avg:     m.home_concede_avg,
+      away_concede_avg:     m.away_concede_avg,
+      home_draw_rate:       m.home_draw_rate,
+      away_draw_rate:       m.away_draw_rate,
+      h2h_draw_rate:        m.h2h_draw_rate,
+      draw_score:           0,
+      draw_probability:     0,
+      confidence:           0,
+      status:               'scheduled',
+      external_id:          m.external_id,
+      home_team_ext_id:     m.home_team_id,
+      away_team_ext_id:     m.away_team_id,
+      league_ext_id:        m.league_id_ext,
+      has_real_team_stats:  m.has_real_team_stats,
     }))
 
     const { error } = await supabaseAdmin
@@ -127,7 +163,7 @@ async function upsertTodayMatches(today: string): Promise<number> {
     if (error) {
       console.error(`[pipeline] upsert error for ${first.league_name}:`, error.message)
     } else {
-      console.log(`[pipeline] Upserted ${rows.length} matches for ${first.league_name}`)
+      console.log(`[pipeline] upserted ${rows.length} for ${first.league_name}`)
       totalUpserted += rows.length
     }
   }
@@ -135,21 +171,25 @@ async function upsertTodayMatches(today: string): Promise<number> {
   return totalUpserted
 }
 
-// ─── Shared pipeline logic ────────────────────────────────────────────────────
+// ─── Core pipeline ─────────────────────────────────────────────────────────────
 
 async function runPipeline(): Promise<NextResponse> {
   const now = new Date()
-  const today = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`
+  const today = [
+    now.getUTCFullYear(),
+    String(now.getUTCMonth() + 1).padStart(2, '0'),
+    String(now.getUTCDate()).padStart(2, '0'),
+  ].join('-')
 
   let fetched = 0
-
   try {
     fetched = await upsertTodayMatches(today)
-  } catch (err: unknown) {
+  } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     console.error('[pipeline] fetch failed:', message)
   }
 
+  // Score all of today's scheduled matches
   const { data: matches, error: matchErr } = await supabase
     .from('matches')
     .select('*, leagues(name, country, avg_draw_rate, draw_boost)')
@@ -164,13 +204,14 @@ async function runPipeline(): Promise<NextResponse> {
     )
   }
 
-  const scored = matches.map((match) => {
-    const drawScore       = calculateDrawScore(match as any)
-    const drawProbability = calculateDrawProbability(match.xg_home, match.xg_away)
-    const confidence      = scoreToConfidence(drawScore)
-    return { ...match, draw_score: drawScore, draw_probability: drawProbability, confidence }
-  })
+  const scored = matches.map((match) => ({
+    ...match,
+    draw_score:       calculateDrawScore(match as any),
+    draw_probability: calculateDrawProbability(match.xg_home, match.xg_away),
+    confidence:       scoreToConfidence(calculateDrawScore(match as any)),
+  }))
 
+  // Persist scores back to matches
   await Promise.all(
     scored.map((m) =>
       supabaseAdmin
@@ -184,13 +225,20 @@ async function runPipeline(): Promise<NextResponse> {
     )
   )
 
+  // Clear today's predictions and rebuild
   await supabaseAdmin
     .from('predictions')
     .delete()
     .eq('prediction_date', today)
 
+  // Sort: primary = draw_score DESC, tiebreak = real team stats first
   const top10 = [...scored]
-    .sort((a, b) => b.draw_score - a.draw_score)
+    .sort((a, b) => {
+      if (b.draw_score !== a.draw_score) return b.draw_score - a.draw_score
+      const aReal = (a as any).has_real_team_stats ? 1 : 0
+      const bReal = (b as any).has_real_team_stats ? 1 : 0
+      return bReal - aReal
+    })
     .slice(0, 10)
 
   const { error: insertErr } = await supabaseAdmin
@@ -213,7 +261,7 @@ async function runPipeline(): Promise<NextResponse> {
 
   return NextResponse.json({
     success:     true,
-    fetched:     fetched,
+    fetched,
     predictions: top10.length,
     top_pick:    top10[0]
       ? `${top10[0].home_team_name} vs ${top10[0].away_team_name} (score: ${top10[0].draw_score})`
