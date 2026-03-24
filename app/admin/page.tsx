@@ -21,6 +21,8 @@ interface LogLine {
 interface SignalImpact {
   count: number
   hitRate: number | null
+  label?: string
+  range?: string
 }
 
 interface AccuracyData {
@@ -44,6 +46,10 @@ interface AccuracyData {
     withForm: SignalImpact
     withoutForm: SignalImpact
     sweetSpotOdds: SignalImpact & { range: string }
+    // New in v3
+    fatigueHigh?: SignalImpact
+    midRangeOdds?: SignalImpact & { range: string }
+    realTeamStats?: SignalImpact
   }
   reliabilityBuckets: Array<{
     scoreRange: string
@@ -120,9 +126,17 @@ export default function AdminPage() {
     try {
       const res  = await fetch('/api/model-accuracy')
       const data = await res.json()
+      if (data.error) {
+        addLog(`Accuracy error: ${data.error}`, 'error')
+        setAccStatus('error')
+        return
+      }
       setAccuracy(data)
       setAccStatus('success')
-    } catch { setAccStatus('error') }
+    } catch (err) {
+      addLog(`Accuracy load error: ${err instanceof Error ? err.message : String(err)}`, 'error')
+      setAccStatus('error')
+    }
   }
 
   async function updateAccuracy() {
@@ -167,6 +181,23 @@ export default function AdminPage() {
   const muted    = 'var(--radar-muted)'
   const green    = 'var(--radar-green)'
 
+  // Build signal rows dynamically so new fields auto-render
+  const buildSignalRows = (si: AccuracyData['signalImpact']) => {
+    const rows: Array<{ label: string; count: number; hitRate: number | null; range?: string }> = [
+      { label: 'Real H2H data', ...si.realH2H },
+      { label: 'Estimated H2H', ...si.estimatedH2H },
+      { label: 'With form data', ...si.withForm },
+      { label: 'Without form', ...si.withoutForm },
+    ]
+    if (si.fatigueHigh) {
+      rows.push({ label: si.fatigueHigh.label ?? 'Avg ≥3 games/14d', ...si.fatigueHigh })
+    }
+    if (si.realTeamStats) {
+      rows.push({ label: 'Real team stats', ...si.realTeamStats })
+    }
+    return rows
+  }
+
   return (
     <div className="min-h-screen" style={{ background: 'var(--radar-bg)', color: 'var(--radar-text)' }}>
       {/* Header */}
@@ -205,7 +236,7 @@ export default function AdminPage() {
         <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
           <h2 className="font-semibold mb-1">Step 2 — Run enhanced pipeline</h2>
           <p className="text-sm mb-2" style={{ color: muted }}>
-            Fetches fixtures + odds, team stats, form, H2H, and computes predictions via draw engine v3.
+            Fetches fixtures + odds, team stats, form, H2H, and computes predictions via draw engine v5.
           </p>
           <ul className="text-xs mb-4 list-disc list-inside" style={{ color: muted }}>
             <li>Real H2H draw rate (weighted recent-biased)</li>
@@ -214,16 +245,25 @@ export default function AdminPage() {
             <li>Line movement — opening odds vs current (stored for tomorrow)</li>
             <li>Platt-scaled confidence (identity until calibrated)</li>
           </ul>
-          <button onClick={runPipeline} disabled={status === 'loading'}
-            className="px-5 py-2 rounded font-medium text-sm transition-all"
-            style={{
-              background: status === 'loading' ? 'rgba(255,255,255,0.05)' : 'rgba(0,255,135,0.1)',
-              color: status === 'loading' ? muted : green,
-              border: `1px solid ${status === 'loading' ? border : 'rgba(0,255,135,0.3)'}`,
-              cursor: status === 'loading' ? 'not-allowed' : 'pointer',
-            }}>
-            {status === 'loading' ? 'Running pipeline…' : '▶ Run pipeline'}
-          </button>
+          <div className="flex gap-3 items-center">
+            <button onClick={runPipeline} disabled={status === 'loading'}
+              className="px-5 py-2 rounded font-medium text-sm transition-all"
+              style={{
+                background: status === 'loading' ? 'rgba(255,255,255,0.05)' : 'rgba(0,255,135,0.1)',
+                color: status === 'loading' ? muted : green,
+                border: `1px solid ${status === 'loading' ? border : 'rgba(0,255,135,0.3)'}`,
+                cursor: status === 'loading' ? 'not-allowed' : 'pointer',
+              }}>
+              {status === 'loading' ? 'Running pipeline…' : '▶ Run pipeline'}
+            </button>
+            {status === 'success' && (
+              <a href="/"
+                className="px-4 py-2 rounded font-medium text-sm"
+                style={{ background: 'rgba(0,255,135,0.08)', color: green, border: '1px solid rgba(0,255,135,0.2)' }}>
+                View predictions →
+              </a>
+            )}
+          </div>
         </section>
 
         {/* Step 3 — Accuracy */}
@@ -286,12 +326,7 @@ export default function AdminPage() {
                 <div>
                   <p className="text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: muted }}>Signal impact</p>
                   <div className="grid grid-cols-2 gap-2">
-                    {[
-                      { label: 'Real H2H data', ...accuracy.signalImpact.realH2H },
-                      { label: 'Estimated H2H', ...accuracy.signalImpact.estimatedH2H },
-                      { label: 'With form data', ...accuracy.signalImpact.withForm },
-                      { label: 'Without form', ...accuracy.signalImpact.withoutForm },
-                    ].map((s) => (
+                    {buildSignalRows(accuracy.signalImpact).map((s) => (
                       <div key={s.label} className="rounded p-2 flex justify-between items-center"
                         style={{ background: 'var(--radar-bg)', border: `1px solid ${border}` }}>
                         <span className="text-xs" style={{ color: muted }}>{s.label}</span>
@@ -302,6 +337,8 @@ export default function AdminPage() {
                       </div>
                     ))}
                   </div>
+
+                  {/* Sweet spot odds */}
                   {accuracy.signalImpact.sweetSpotOdds.count > 0 && (
                     <div className="rounded p-2 flex justify-between items-center mt-2"
                       style={{ background: 'rgba(0,255,135,0.05)', border: '1px solid rgba(0,255,135,0.2)' }}>
@@ -312,6 +349,22 @@ export default function AdminPage() {
                         {accuracy.signalImpact.sweetSpotOdds.hitRate ?? '—'}%
                         <span className="text-xs font-normal ml-1" style={{ color: muted }}>
                           ({accuracy.signalImpact.sweetSpotOdds.count})
+                        </span>
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Mid-range odds */}
+                  {accuracy.signalImpact.midRangeOdds && accuracy.signalImpact.midRangeOdds.count > 0 && (
+                    <div className="rounded p-2 flex justify-between items-center mt-1"
+                      style={{ background: 'var(--radar-bg)', border: `1px solid ${border}` }}>
+                      <span className="text-xs" style={{ color: muted }}>
+                        Mid-range odds ({accuracy.signalImpact.midRangeOdds.range})
+                      </span>
+                      <span className="text-sm font-bold" style={{ color: '#f59e0b' }}>
+                        {accuracy.signalImpact.midRangeOdds.hitRate ?? '—'}%
+                        <span className="text-xs font-normal ml-1" style={{ color: muted }}>
+                          ({accuracy.signalImpact.midRangeOdds.count})
                         </span>
                       </span>
                     </div>
@@ -436,10 +489,15 @@ export default function AdminPage() {
                 Top pick: <span style={{ color: 'var(--radar-text)' }}>{result.top_pick}</span>
               </p>
             )}
-            <a href="/" className="mt-4 inline-block text-sm font-medium px-4 py-2 rounded transition-all"
-              style={{ background: 'rgba(0,255,135,0.1)', color: green, border: '1px solid rgba(0,255,135,0.25)' }}>
-              View predictions →
-            </a>
+          </section>
+        )}
+
+        {/* Pipeline error */}
+        {result && status === 'error' && (
+          <section className="rounded-xl p-5"
+            style={{ background: 'rgba(239,68,68,0.05)', border: '1px solid rgba(239,68,68,0.2)' }}>
+            <p className="text-sm font-semibold mb-2" style={{ color: '#ef4444' }}>Pipeline error</p>
+            <p className="text-xs font-mono" style={{ color: muted }}>{result.error}</p>
           </section>
         )}
 
