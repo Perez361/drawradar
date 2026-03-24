@@ -227,7 +227,7 @@ export async function fetchOddsForFixture(
       'marathonbet',
     ]
 
-    function extractDraw(bm: ApiFootballOdds['bookmakers'][0]): number {
+    const extractDraw = (bm: ApiFootballOdds['bookmakers'][0]): number =>{
       // bet id=1 is "Match Winner" on API-Football
       const bet = bm.bets.find((b) => b.id === 1 || b.name === 'Match Winner')
       if (!bet) return 0
