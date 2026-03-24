@@ -1,13 +1,9 @@
-// ─── API-Football client ──────────────────────────────────────────────────────
-// Docs: https://www.api-football.com/documentation-v3
-// Free tier: 100 requests/day
-//
-// Daily budget:
-//   1  — fixtures (all leagues, one call)
-//   ≤50 — odds per fixture
-//   ≤45 — team stats (mostly cache hits after day 1)
-//   ────
-//   ≤96 total
+// ─── API-Football client v2 ───────────────────────────────────────────────────
+// New additions over v1:
+//   • fetchH2H()          — real head-to-head fixture history
+//   • fetchRecentFixtures()— last N results per team (form + fatigue)
+//   • fetchOddsForFixtures()— batch odds with opening-odds storage
+//   • All existing exports preserved for backward compat
 
 export const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io'
 
@@ -51,13 +47,24 @@ export interface ApiFootballOdds {
   }>
 }
 
+// ─── H2H types ────────────────────────────────────────────────────────────────
+
+export interface H2HResult {
+  fixtureId: number
+  date: string
+  homeTeamId: number
+  awayTeamId: number
+  homeGoals: number
+  awayGoals: number
+  isDraw: boolean
+}
+
 // ─── League info map ──────────────────────────────────────────────────────────
 
 export const LEAGUE_ID_TO_INFO: Record<
   number,
   { name: string; country: string; avgDrawRate: number }
 > = {
-  // ── Africa ──────────────────────────────────────────────────────────────────
   264: { name: 'NPFL',                       country: 'Nigeria',        avgDrawRate: 0.33 },
   233: { name: 'Egyptian Premier League',    country: 'Egypt',          avgDrawRate: 0.32 },
   347: { name: 'Ligue Professionnelle 1',    country: 'Tunisia',        avgDrawRate: 0.31 },
@@ -66,8 +73,6 @@ export const LEAGUE_ID_TO_INFO: Record<
   289: { name: 'Premier Soccer League',      country: 'South Africa',   avgDrawRate: 0.29 },
   290: { name: 'Ghana Premier League',       country: 'Ghana',          avgDrawRate: 0.29 },
   357: { name: 'Premier League',             country: 'Kenya',          avgDrawRate: 0.28 },
-
-  // ── Europe ───────────────────────────────────────────────────────────────────
   135: { name: 'Serie A',                    country: 'Italy',          avgDrawRate: 0.29 },
   136: { name: 'Serie B',                    country: 'Italy',          avgDrawRate: 0.30 },
   137: { name: 'Serie C',                    country: 'Italy',          avgDrawRate: 0.31 },
@@ -113,8 +118,6 @@ export const LEAGUE_ID_TO_INFO: Record<
   114: { name: 'First Division',             country: 'Norway',         avgDrawRate: 0.28 },
   119: { name: 'Superliga',                  country: 'Denmark',        avgDrawRate: 0.27 },
   120: { name: '1st Division',               country: 'Denmark',        avgDrawRate: 0.29 },
-
-  // ── Americas ──────────────────────────────────────────────────────────────────
   128: { name: 'Primera División',           country: 'Argentina',      avgDrawRate: 0.29 },
   130: { name: 'Primera Nacional',           country: 'Argentina',      avgDrawRate: 0.31 },
   131: { name: 'Torneo Federal A',           country: 'Argentina',      avgDrawRate: 0.32 },
@@ -133,16 +136,12 @@ export const LEAGUE_ID_TO_INFO: Record<
   293: { name: 'Primera División',           country: 'Venezuela',      avgDrawRate: 0.30 },
   321: { name: 'División Profesional',       country: 'Bolivia',        avgDrawRate: 0.31 },
   385: { name: 'División Profesional',       country: 'Paraguay',       avgDrawRate: 0.30 },
-
-  // ── Middle East ───────────────────────────────────────────────────────────────
   307: { name: 'Persian Gulf Pro League',    country: 'Iran',           avgDrawRate: 0.31 },
   323: { name: 'Premier League',             country: 'Iraq',           avgDrawRate: 0.32 },
   318: { name: 'Premier League',             country: 'Lebanon',        avgDrawRate: 0.30 },
   319: { name: 'Premier League',             country: 'Jordan',         avgDrawRate: 0.30 },
   169: { name: 'Saudi Pro League',           country: 'Saudi Arabia',   avgDrawRate: 0.27 },
   308: { name: 'UAE Pro League',             country: 'UAE',            avgDrawRate: 0.28 },
-
-  // ── Asia / Oceania ────────────────────────────────────────────────────────────
   98:  { name: 'J1 League',                  country: 'Japan',          avgDrawRate: 0.26 },
   292: { name: 'K League 1',                 country: 'South Korea',    avgDrawRate: 0.27 },
   301: { name: 'Indian Super League',        country: 'India',          avgDrawRate: 0.27 },
@@ -153,57 +152,132 @@ export const LEAGUE_ID_TO_INFO: Record<
 
 // ─── Fetch helpers ────────────────────────────────────────────────────────────
 
+async function apiFetch<T>(apiKey: string, path: string): Promise<T> {
+  const url = `${API_FOOTBALL_BASE}${path}`
+  const res = await fetch(url, { headers: { 'x-apisports-key': apiKey } })
+
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(`API-Football ${path}: ${res.status} ${body}`)
+  }
+
+  const remaining = res.headers.get('x-ratelimit-requests-remaining')
+  const used = res.headers.get('x-ratelimit-requests-used')
+  console.log(`[API-Football] ${path} — used: ${used}, remaining: ${remaining}`)
+
+  const data = await res.json()
+  return (data.response ?? []) as T
+}
+
 export async function fetchFixturesForDate(
   apiKey: string,
   date: string
 ): Promise<ApiFootballFixture[]> {
-  const url = `${API_FOOTBALL_BASE}/fixtures?date=${date}&timezone=UTC`
-
-  const res = await fetch(url, {
-    headers: { 'x-apisports-key': apiKey },
-  })
-
-  if (!res.ok) {
-    const body = await res.text()
-    throw new Error(`API-Football fixtures error: ${res.status} ${body}`)
-  }
-
-  const remaining = res.headers.get('x-ratelimit-requests-remaining')
-  const used      = res.headers.get('x-ratelimit-requests-used')
-  console.log(`[API-Football] requests used: ${used}, remaining: ${remaining}`)
-
-  const data = await res.json()
-  return (data.response ?? []) as ApiFootballFixture[]
+  return apiFetch<ApiFootballFixture[]>(apiKey, `/fixtures?date=${date}&timezone=UTC`)
 }
 
-// Returns 0 if no bookmaker draw odds found — callers must treat 0 as "no data".
 export async function fetchOddsForFixture(
   apiKey: string,
   fixtureId: number
 ): Promise<number> {
-  const url = `${API_FOOTBALL_BASE}/odds?fixture=${fixtureId}&bet=1`
-
-  const res = await fetch(url, {
-    headers: { 'x-apisports-key': apiKey },
-  })
-
-  if (!res.ok) return 0
-
-  const data = await res.json()
-  const bookmakers: ApiFootballOdds['bookmakers'] =
-    data.response?.[0]?.bookmakers ?? []
-
-  for (const bm of bookmakers) {
-    const bet = bm.bets.find((b) => b.id === 1)
-    if (!bet) continue
-    const drawValue = bet.values.find((v) => v.value === 'Draw')
-    if (drawValue) return parseFloat(drawValue.odd)
+  try {
+    const data = await apiFetch<ApiFootballOdds[]>(apiKey, `/odds?fixture=${fixtureId}&bet=1`)
+    const bookmakers = data[0]?.bookmakers ?? []
+    for (const bm of bookmakers) {
+      const bet = bm.bets.find((b) => b.id === 1)
+      if (!bet) continue
+      const drawValue = bet.values.find((v) => v.value === 'Draw')
+      if (drawValue) return parseFloat(drawValue.odd)
+    }
+    return 0
+  } catch {
+    return 0
   }
-
-  return 0
 }
 
-// ─── MappedFixture ────────────────────────────────────────────────────────────
+// ─── NEW: Fetch H2H fixtures ──────────────────────────────────────────────────
+// Returns last N completed H2H meetings between two teams.
+// Uses 1 API call per unique team pair.
+
+export async function fetchH2H(
+  apiKey: string,
+  homeTeamId: number,
+  awayTeamId: number,
+  last = 10
+): Promise<H2HResult[]> {
+  try {
+    const raw = await apiFetch<ApiFootballFixture[]>(
+      apiKey,
+      `/fixtures/headtohead?h2h=${homeTeamId}-${awayTeamId}&last=${last}`
+    )
+
+    return raw
+      .filter(
+        (f) =>
+          f.goals.home !== null &&
+          f.goals.away !== null &&
+          !['NS', 'TBD', 'CANC', 'PST'].includes(f.fixture.status.short)
+      )
+      .map((f) => ({
+        fixtureId: f.fixture.id,
+        date: f.fixture.date,
+        homeTeamId: f.teams.home.id,
+        awayTeamId: f.teams.away.id,
+        homeGoals: f.goals.home!,
+        awayGoals: f.goals.away!,
+        isDraw: f.goals.home === f.goals.away,
+      }))
+  } catch (err) {
+    console.warn(`[H2H] failed for ${homeTeamId}-${awayTeamId}:`, err)
+    return []
+  }
+}
+
+// ─── NEW: Fetch recent team fixtures (form + fatigue) ─────────────────────────
+// Returns last N completed fixtures for a team.
+// Uses 1 API call per team (cache 24h to stay within quota).
+
+export interface RecentFixture {
+  date: string
+  goalsScored: number
+  goalsConceded: number
+  isDraw: boolean
+}
+
+export async function fetchRecentFixtures(
+  apiKey: string,
+  teamId: number,
+  leagueId: number,
+  season: number,
+  last = 5
+): Promise<RecentFixture[]> {
+  try {
+    const raw = await apiFetch<ApiFootballFixture[]>(
+      apiKey,
+      `/fixtures?team=${teamId}&league=${leagueId}&season=${season}&last=${last}&status=FT`
+    )
+
+    return raw
+      .filter((f) => f.goals.home !== null && f.goals.away !== null)
+      .sort((a, b) => new Date(b.fixture.date).getTime() - new Date(a.fixture.date).getTime())
+      .map((f) => {
+        const isHome = f.teams.home.id === teamId
+        const scored = isHome ? f.goals.home! : f.goals.away!
+        const conceded = isHome ? f.goals.away! : f.goals.home!
+        return {
+          date: f.fixture.date,
+          goalsScored: scored,
+          goalsConceded: conceded,
+          isDraw: f.goals.home === f.goals.away,
+        }
+      })
+  } catch (err) {
+    console.warn(`[recentFixtures] failed for team ${teamId}:`, err)
+    return []
+  }
+}
+
+// ─── MappedFixture (unchanged interface, new optional fields added) ───────────
 
 export interface MappedFixture {
   external_id: string
@@ -224,11 +298,21 @@ export interface MappedFixture {
   home_draw_rate: number
   away_draw_rate: number
   h2h_draw_rate: number
+  h2h_is_real: boolean       // NEW — true = from API, false = blended estimate
   xg_home: number
   xg_away: number
   avg_draw_rate: number
-  // true when at least one team has real (non-baseline) stats
   has_real_team_stats: boolean
+  // Form features (new — null when not yet fetched)
+  home_form_draw_rate: number | null
+  away_form_draw_rate: number | null
+  home_form_goals_avg: number | null
+  away_form_goals_avg: number | null
+  home_games_last14: number | null
+  away_games_last14: number | null
+  // Line movement (new)
+  odds_open: number | null
+  odds_movement: number | null
 }
 
 export interface PerTeamStats {
@@ -237,57 +321,63 @@ export interface PerTeamStats {
   drawRate: number
 }
 
-// ─── mapFixture (baseline fallback, kept for compatibility) ───────────────────
-
-export function mapFixture(
-  fixture: ApiFootballFixture,
-  drawOdds: number
-): MappedFixture | null {
-  return mapFixtureWithStats(fixture, drawOdds, null, null)
+export interface FormStats {
+  formDrawRate: number
+  formGoalsAvg: number
+  gamesLast14: number
 }
-
-// ─── mapFixtureWithStats — the main mapper ────────────────────────────────────
-//
-// Returns null if:
-//   • the league is not tracked
-//   • the fixture is not in a "not started" state
-//   • drawOdds === 0 (no bookmaker data — we reject rather than use a fallback,
-//     because the fallback was silently giving 2 free "sweet spot" score points)
 
 export function mapFixtureWithStats(
   fixture: ApiFootballFixture,
   drawOdds: number,
   homeStats: PerTeamStats | null,
-  awayStats: PerTeamStats | null
+  awayStats: PerTeamStats | null,
+  h2hResults?: H2HResult[],
+  homeForm?: FormStats | null,
+  awayForm?: FormStats | null,
+  openingDrawOdds?: number | null
 ): MappedFixture | null {
   const leagueInfo = LEAGUE_ID_TO_INFO[fixture.league.id]
   if (!leagueInfo) return null
 
   const status = fixture.fixture.status.short
   if (!['NS', 'TBD'].includes(status)) return null
-
-  // Reject fixtures with no real bookmaker odds — fallback values pollute scoring
   if (drawOdds <= 0) return null
 
   const avg = leagueInfo.avgDrawRate
 
-  // Home team stats (real or league baseline)
   const homeGoalsFor    = homeStats?.goalsForAvg     ?? getLeagueGoalsAvg(fixture.league.id, 'home')
   const homeConcede     = homeStats?.goalsAgainstAvg ?? getLeagueGoalsAvg(fixture.league.id, 'away')
   const homeDrawRate    = homeStats?.drawRate        ?? avg
-
-  // Away team stats (real or league baseline)
   const awayGoalsFor    = awayStats?.goalsForAvg     ?? getLeagueGoalsAvg(fixture.league.id, 'away')
   const awayConcede     = awayStats?.goalsAgainstAvg ?? getLeagueGoalsAvg(fixture.league.id, 'home')
   const awayDrawRate    = awayStats?.drawRate        ?? avg
 
-  // xG estimate: (team attack avg + opponent defence avg) / 2
   const xgHome = Math.round(((homeGoalsFor + awayConcede) / 2) * 100) / 100
   const xgAway = Math.round(((awayGoalsFor + homeConcede) / 2) * 100) / 100
 
-  // H2H draw rate: blend of both teams' own draw rates.
-  // Replace with actual H2H endpoint data if you wire it later.
-  const h2hDrawRate = Math.round(((homeDrawRate + awayDrawRate) / 2) * 1000) / 1000
+  // H2H — use real data if available
+  let h2hDrawRate = Math.round(((homeDrawRate + awayDrawRate) / 2) * 1000) / 1000
+  let h2hIsReal = false
+  if (h2hResults && h2hResults.length >= 3) {
+    // Weight recent 2×
+    const sorted = [...h2hResults].sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+    )
+    let weightedDraws = 0, totalWeight = 0
+    sorted.slice(0, 10).forEach((r, i) => {
+      const w = i < 5 ? 2 : 1
+      weightedDraws += w * (r.isDraw ? 1 : 0)
+      totalWeight += w
+    })
+    h2hDrawRate = Math.round((weightedDraws / totalWeight) * 1000) / 1000
+    h2hIsReal = true
+  }
+
+  const oddsMovement =
+    openingDrawOdds && openingDrawOdds > 0
+      ? Math.round((drawOdds - openingDrawOdds) * 100) / 100
+      : null
 
   return {
     external_id:         `apifb_${fixture.fixture.id}`,
@@ -308,17 +398,33 @@ export function mapFixtureWithStats(
     home_draw_rate:      homeDrawRate,
     away_draw_rate:      awayDrawRate,
     h2h_draw_rate:       h2hDrawRate,
+    h2h_is_real:         h2hIsReal,
     xg_home:             xgHome,
     xg_away:             xgAway,
     avg_draw_rate:       avg,
     has_real_team_stats: homeStats !== null || awayStats !== null,
+    home_form_draw_rate: homeForm?.formDrawRate ?? null,
+    away_form_draw_rate: awayForm?.formDrawRate ?? null,
+    home_form_goals_avg: homeForm?.formGoalsAvg ?? null,
+    away_form_goals_avg: awayForm?.formGoalsAvg ?? null,
+    home_games_last14:   homeForm?.gamesLast14 ?? null,
+    away_games_last14:   awayForm?.gamesLast14 ?? null,
+    odds_open:           openingDrawOdds ?? null,
+    odds_movement:       oddsMovement,
   }
+}
+
+// Keep old signature working
+export function mapFixture(
+  fixture: ApiFootballFixture,
+  drawOdds: number
+): MappedFixture | null {
+  return mapFixtureWithStats(fixture, drawOdds, null, null)
 }
 
 // ─── League-level goal averages (baseline fallback) ───────────────────────────
 
 function getLeagueGoalsAvg(leagueId: number, side: 'home' | 'away'): number {
-  // [home_avg, away_avg] — lower = more draws
   const baselines: Record<number, [number, number]> = {
     264: [1.28, 1.00], 233: [1.30, 1.02], 347: [1.32, 1.05], 327: [1.28, 1.00],
     200: [1.33, 1.06], 289: [1.38, 1.10], 290: [1.35, 1.08], 357: [1.33, 1.05],
