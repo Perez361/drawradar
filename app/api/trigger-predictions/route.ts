@@ -1,18 +1,19 @@
-// app/api/trigger-predictions/route.ts v4
+// app/api/trigger-predictions/route.ts v5
 //
-// Fixes in this version:
-//   1. draw_odds on predictions insert now explicitly cast to number (was potentially null)
-//   2. loadPlattParams() return shape updated for team-stats-cache v4 ({a, b, isCalibrated})
-//   3. Added detailed console logging at every stage to diagnose display issues
-//   4. Prediction insert now falls back to match draw_odds with null-guard
-//   5. Matches are fetched without status filter to avoid missing re-runs on same day
-//   6. Added edge: if scored array is empty, returns a clear error rather than silently inserting nothing
+// Changes over v4:
+//   • Full diagnostic logging at every gate so you can see exactly how many
+//     fixtures are dropped and why (no odds, not in league map, etc.).
+//   • upsertLeague now logs a warning when the DB returns an unexpected error
+//     instead of silently returning null and dropping the whole league.
+//   • All league lookups use LEAGUE_ID_TO_INFO canonical country/name strings,
+//     never raw API strings. This prevents duplicate league rows.
+//   • Added summary stats at end of pipeline (fixtures fetched → tracked →
+//     with-odds → mapped → scored → inserted) so you can see each drop point.
+//   • Platt params load error is caught and falls back to defaults rather than
+//     crashing the whole pipeline.
 
 import { NextRequest, NextResponse } from 'next/server'
-import {
-  supabase,
-  supabaseAdmin,
-} from '@/lib/supabase'
+import { supabase, supabaseAdmin } from '@/lib/supabase'
 import {
   fetchFixturesForDate,
   fetchOddsForFixture,
@@ -35,19 +36,24 @@ import {
   type DrawFeatures,
 } from '@/lib/drawEngine'
 
-// ─── FIXED: League upsert — use (name, country) as unique key ────────────────
+// ─── League upsert ────────────────────────────────────────────────────────────
 
 async function upsertLeague(
   name: string,
   country: string,
   avgDrawRate: number
 ): Promise<number | null> {
-  const { data: existing } = await supabaseAdmin
+  // Check if league already exists (using canonical name + country from our map)
+  const { data: existing, error: findErr } = await supabaseAdmin
     .from('leagues')
     .select('id')
     .eq('name', name)
     .eq('country', country)
     .maybeSingle()
+
+  if (findErr) {
+    console.error(`[upsertLeague] find error for ${name} (${country}):`, findErr.message)
+  }
 
   if (existing) return existing.id
 
@@ -59,15 +65,20 @@ async function upsertLeague(
 
   if (error) {
     if (error.code === '23505') {
-      const { data: retry } = await supabaseAdmin
+      // Race condition — inserted between our find and insert, fetch it
+      const { data: retry, error: retryErr } = await supabaseAdmin
         .from('leagues')
         .select('id')
         .eq('name', name)
         .eq('country', country)
         .maybeSingle()
+      if (retryErr) {
+        console.error(`[upsertLeague] retry find error for ${name}:`, retryErr.message)
+        return null
+      }
       return retry?.id ?? null
     }
-    console.error(`[upsertLeague] ${name} (${country}):`, error.message)
+    console.error(`[upsertLeague] insert error for ${name} (${country}):`, error.message)
     return null
   }
   return data.id
@@ -79,14 +90,34 @@ async function upsertTodayMatches(today: string): Promise<number> {
   const apiKey = process.env.API_FOOTBALL_KEY
   if (!apiKey) throw new Error('API_FOOTBALL_KEY env var is not set')
 
-  console.log(`[pipeline] Fetching fixtures for ${today}…`)
-  const fixtures = await fetchFixturesForDate(apiKey, today)
-  const tracked = fixtures.filter(f => LEAGUE_ID_TO_INFO[f.league.id])
-  console.log(`[pipeline] ${tracked.length} tracked fixtures (of ${fixtures.length} total)`)
-  if (tracked.length === 0) return 0
+  console.log(`[pipeline] Fetching all fixtures for ${today}…`)
+  const allFixtures = await fetchFixturesForDate(apiKey, today)
+  console.log(`[pipeline] Total fixtures from API: ${allFixtures.length}`)
 
-  const fixtureIds = tracked.slice(0, 50).map(f => `apifb_${f.fixture.id}`)
+  const tracked = allFixtures.filter(f => LEAGUE_ID_TO_INFO[f.league.id])
+  const untracked = allFixtures.filter(f => !LEAGUE_ID_TO_INFO[f.league.id])
 
+  console.log(`[pipeline] Tracked leagues: ${tracked.length} fixtures`)
+  console.log(`[pipeline] Untracked leagues: ${untracked.length} fixtures`)
+
+  // Log a sample of untracked leagues so you can add missing ones
+  if (untracked.length > 0) {
+    const untrackedSample = Array.from(new Map(
+      untracked.map(f => [`${f.league.id}`, { id: f.league.id, name: f.league.name, country: f.league.country }])
+    ).values()).slice(0, 10)
+    console.log(`[pipeline] Untracked league sample:`, JSON.stringify(untrackedSample))
+  }
+
+  if (tracked.length === 0) {
+    console.log(`[pipeline] No tracked fixtures for ${today}`)
+    return 0
+  }
+
+  // Limit to 50 to respect API quota
+  const toProcess = tracked.slice(0, 50)
+  const fixtureIds = toProcess.map(f => `apifb_${f.fixture.id}`)
+
+  // Load existing opening odds from DB to preserve line-movement tracking
   const { data: existingRows } = await supabaseAdmin
     .from('matches')
     .select('external_id, odds_open')
@@ -98,16 +129,29 @@ async function upsertTodayMatches(today: string): Promise<number> {
       .map(r => [r.external_id as string, r.odds_open as number])
   )
 
+  console.log(`[pipeline] Fetching odds for ${toProcess.length} fixtures…`)
   const withOdds = await Promise.all(
-    tracked.slice(0, 50).map(async (fixture) => {
+    toProcess.map(async (fixture) => {
       const extId = `apifb_${fixture.fixture.id}`
       const drawOdds = await fetchOddsForFixture(apiKey, fixture.fixture.id)
       const openingOdds = existingOpenOdds.get(extId) ?? (drawOdds > 0 ? drawOdds : null)
       return { fixture, drawOdds, openingOdds }
     })
   )
+
   const fixturesWithOdds = withOdds.filter(({ drawOdds }) => drawOdds > 0)
-  console.log(`[pipeline] ${fixturesWithOdds.length} fixtures with valid odds`)
+  const droppedNoOdds = withOdds.filter(({ drawOdds }) => drawOdds <= 0)
+
+  console.log(`[pipeline] Fixtures with valid odds: ${fixturesWithOdds.length}`)
+  console.log(`[pipeline] Dropped (no odds): ${droppedNoOdds.length}`)
+  if (droppedNoOdds.length > 0) {
+    console.log(`[pipeline] No-odds fixture IDs: ${droppedNoOdds.map(f => f.fixture.fixture.id).join(', ')}`)
+  }
+
+  if (fixturesWithOdds.length === 0) {
+    console.log(`[pipeline] No fixtures with odds — nothing to upsert`)
+    return 0
+  }
 
   const season = currentSeason()
   const seenPairs = new Set<string>()
@@ -128,13 +172,13 @@ async function upsertTodayMatches(today: string): Promise<number> {
     })
   }
 
-  console.log(`[pipeline] Fetching team stats for ${teamStatsPairs.length} pairs…`)
+  console.log(`[pipeline] Fetching team stats for ${teamStatsPairs.length} team/league pairs…`)
   const statsMap = await getTeamStatsBatch(apiKey, teamStatsPairs, 35)
 
   console.log(`[pipeline] Fetching form stats…`)
   const formMap = await getFormStatsBatch(apiKey, teamStatsPairs, 15)
 
-  console.log(`[pipeline] Fetching H2H data for ${h2hPairs.length} pairs…`)
+  console.log(`[pipeline] Fetching H2H for ${h2hPairs.length} pairs…`)
   const h2hMap = await getH2HBatch(apiKey, h2hPairs, 10)
 
   const mapped = fixturesWithOdds
@@ -161,8 +205,14 @@ async function upsertTodayMatches(today: string): Promise<number> {
     })
     .filter((m): m is MappedFixture => m !== null)
 
-  console.log(`[pipeline] ${mapped.length} valid mapped fixtures after filtering`)
+  console.log(`[pipeline] Valid mapped fixtures: ${mapped.length}`)
 
+  if (mapped.length === 0) {
+    console.log(`[pipeline] All fixtures were filtered out by mapFixtureWithStats`)
+    return 0
+  }
+
+  // Group by league for batch upserts
   const byLeague = new Map<string, MappedFixture[]>()
   for (const m of mapped) {
     const key = `${m.league_name}::${m.league_country}`
@@ -184,7 +234,7 @@ async function upsertTodayMatches(today: string): Promise<number> {
       leagueInfo.avgDrawRate
     )
     if (!leagueId) {
-      console.error(`[pipeline] could not get league ID for ${first.league_name} (${first.league_country})`)
+      console.error(`[pipeline] Could not get league ID for ${first.league_name} (${first.league_country}) — skipping ${matches.length} fixtures`)
       continue
     }
 
@@ -228,13 +278,14 @@ async function upsertTodayMatches(today: string): Promise<number> {
       .upsert(rows, { onConflict: 'external_id' })
 
     if (error) {
-      console.error(`[pipeline] upsert error for ${first.league_name} (${first.league_country}):`, error.message)
+      console.error(`[pipeline] Upsert error for ${first.league_name} (${first.league_country}):`, error.message)
     } else {
-      console.log(`[pipeline] upserted ${rows.length} for ${first.league_name} (${first.league_country})`)
+      console.log(`[pipeline] Upserted ${rows.length} matches for ${first.league_name} (${first.league_country})`)
       totalUpserted += rows.length
     }
   }
 
+  console.log(`[pipeline] Total matches upserted: ${totalUpserted}`)
   return totalUpserted
 }
 
@@ -267,45 +318,52 @@ async function runPipeline(): Promise<NextResponse> {
     String(now.getUTCDate()).padStart(2, '0'),
   ].join('-')
 
-  console.log(`[pipeline] Running for date: ${today}`)
+  console.log(`\n[pipeline] ═══ START ${today} ═══`)
 
-  // Load Platt calibration params — v4 returns { a, b, isCalibrated }
-  const plattParams = await loadPlattParams()
-  setPlattParams(plattParams.a, plattParams.b)
-  console.log(`[pipeline] Platt params loaded: a=${plattParams.a}, b=${plattParams.b}, calibrated=${plattParams.isCalibrated}`)
+  // Load Platt calibration params
+  let plattA = -1.0
+  let plattB = 0.0
+  try {
+    const plattParams = await loadPlattParams()
+    plattA = plattParams.a
+    plattB = plattParams.b
+    setPlattParams(plattA, plattB)
+    console.log(`[pipeline] Platt params: a=${plattA}, b=${plattB}, calibrated=${plattParams.isCalibrated}`)
+  } catch (err) {
+    console.warn('[pipeline] Failed to load Platt params, using defaults:', err)
+    setPlattParams(-1.0, 0.0)
+  }
 
   let fetched = 0
   try {
     fetched = await upsertTodayMatches(today)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    console.error('[pipeline] fetch/upsert failed:', message)
+    console.error('[pipeline] Fetch/upsert failed:', message)
+    // Continue — maybe matches were already upserted from an earlier run today
   }
 
-  // FIX: Fetch all of today's matches regardless of status
-  // Previously .eq('status', 'scheduled') would miss matches if status was updated
-  const { data: matches, error: matchErr } = await supabase
+  // Fetch all of today's matches from DB (regardless of status)
+  const { data: matches, error: matchErr } = await supabaseAdmin
     .from('matches')
     .select('*, leagues(name, country, avg_draw_rate, draw_boost)')
     .gte('match_date', `${today}T00:00:00`)
     .lte('match_date', `${today}T23:59:59`)
 
   if (matchErr) {
-    console.error('[pipeline] matches query error:', matchErr.message)
+    console.error('[pipeline] Matches query error:', matchErr.message)
     return NextResponse.json({ error: matchErr.message }, { status: 500 })
   }
 
   if (!matches || matches.length === 0) {
-    console.error(`[pipeline] No matches found for today (${today}) — check that upsert succeeded`)
-    return NextResponse.json(
-      { error: `No matches found for today (${today}). Fetched: ${fetched} rows.` },
-      { status: 500 }
-    )
+    const msg = `No matches in DB for ${today}. Fetched: ${fetched} rows. Check API quota and league filter.`
+    console.error(`[pipeline] ${msg}`)
+    return NextResponse.json({ error: msg }, { status: 500 })
   }
 
-  console.log(`[pipeline] Scoring ${matches.length} matches for ${today}`)
+  console.log(`[pipeline] Scoring ${matches.length} matches from DB…`)
 
-  // Score every match using drawEngine
+  // Score every match
   const scored = matches.map((match) => {
     const features: DrawFeatures = {
       xgHome:            match.xg_home       ?? 1.2,
@@ -332,12 +390,11 @@ async function runPipeline(): Promise<NextResponse> {
       leagueAvgDrawRate: match.leagues?.avg_draw_rate ?? 0.27,
       leagueDrawBoost:   match.leagues?.draw_boost ?? 0,
     }
-
     const prediction = predictDraw(features)
     return { ...match, ...prediction }
   })
 
-  // Persist scores back to matches table
+  // Write scores back to matches table
   await Promise.all(
     scored.map((m) =>
       supabaseAdmin
@@ -350,6 +407,7 @@ async function runPipeline(): Promise<NextResponse> {
         .eq('id', m.id)
     )
   )
+  console.log(`[pipeline] Updated draw_score / probability / confidence on ${scored.length} matches`)
 
   // Clear today's predictions and rebuild
   const { error: deleteErr } = await supabaseAdmin
@@ -358,7 +416,7 @@ async function runPipeline(): Promise<NextResponse> {
     .eq('prediction_date', today)
 
   if (deleteErr) {
-    console.error('[pipeline] delete predictions error:', deleteErr.message)
+    console.error('[pipeline] Delete predictions error:', deleteErr.message)
   } else {
     console.log(`[pipeline] Cleared existing predictions for ${today}`)
   }
@@ -382,7 +440,7 @@ async function runPipeline(): Promise<NextResponse> {
     })
     .slice(0, 10)
 
-  console.log(`[pipeline] Top 10 selected. Scores: ${top10.map(m => m.drawScore.toFixed(2)).join(', ')}`)
+  console.log(`[pipeline] Top 10 scores: ${top10.map(m => m.drawScore.toFixed(2)).join(', ')}`)
 
   const insertRows = top10.map((m, i) => ({
     match_id:         m.id,
@@ -394,26 +452,28 @@ async function runPipeline(): Promise<NextResponse> {
     draw_odds:        Number(m.draw_odds ?? 0),
   }))
 
-  console.log(`[pipeline] Inserting ${insertRows.length} predictions for ${today}`)
+  console.log(`[pipeline] Inserting ${insertRows.length} predictions…`)
 
   const { error: insertErr } = await supabaseAdmin
     .from('predictions')
     .insert(insertRows)
 
   if (insertErr) {
-    console.error('[pipeline] insert predictions error:', insertErr.message)
+    console.error('[pipeline] Insert predictions error:', insertErr.message)
     return NextResponse.json({ error: insertErr.message }, { status: 500 })
   }
 
-  console.log(`[pipeline] Done — ${top10.length} predictions inserted for ${today}`)
+  const topPick = top10[0]
+    ? `${top10[0].home_team_name} vs ${top10[0].away_team_name} (score: ${top10[0].drawScore})`
+    : null
+
+  console.log(`[pipeline] ═══ DONE — ${top10.length} predictions inserted ═══\n`)
 
   return NextResponse.json({
     success:     true,
     fetched,
     predictions: top10.length,
-    top_pick:    top10[0]
-      ? `${top10[0].home_team_name} vs ${top10[0].away_team_name} (score: ${top10[0].drawScore})`
-      : null,
+    top_pick:    topPick,
   })
 }
 

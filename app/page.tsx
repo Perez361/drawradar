@@ -5,121 +5,26 @@ import type { Prediction } from '@/lib/supabase'
 import Link from 'next/link'
 
 const LEAGUE_FLAGS: Record<string, string> = {
-  // England
   'Premier League':             '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
   'Championship':               '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
   'League One':                 '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
   'League Two':                 '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
   'National League':            '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-
-  // Spain
   'La Liga':                    '🇪🇸',
   'Segunda División':           '🇪🇸',
-  'Primera RFEF':               '🇪🇸',
-
-  // Italy
   'Serie A':                    '🇮🇹',
   'Serie B':                    '🇮🇹',
-  'Serie C':                    '🇮🇹',
-
-  // Germany
   'Bundesliga':                 '🇩🇪',
-  'Bundesliga 2':               '🇩🇪',
-  '3. Liga':                    '🇩🇪',
-
-  // France
+  '2. Bundesliga':              '🇩🇪',
   'Ligue 1':                    '🇫🇷',
   'Ligue 2':                    '🇫🇷',
-  'National 1':                 '🇫🇷',
-
-  // Netherlands
   'Eredivisie':                 '🇳🇱',
-  'Eerste Divisie':             '🇳🇱',
-
-  // Portugal
   'Primeira Liga':              '🇵🇹',
-  'Liga Portugal 2':            '🇵🇹',
-
-  // Turkey
-  'Super Lig':                  '🇹🇷',
-  'TFF 1. Lig':                 '🇹🇷',
-
-  // Belgium
+  'Süper Lig':                  '🇹🇷',
   'Pro League':                 '🇧🇪',
-  'Challenger Pro League':      '🇧🇪',
-
-  // Scotland
-  'Scottish Premiership':       '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
-
-  // Greece
-  'Super League':               '🇬🇷',
-  'Super League 2':             '🇬🇷',
-
-  // Sweden
-  'Allsvenskan':                '🇸🇪',
-  'Superettan':                 '🇸🇪',
-
-  // Norway
-  'Eliteserien':                '🇳🇴',
-  'First Division':             '🇳🇴',
-
-  // Denmark
-  'Superliga':                  '🇩🇰',
-  '1st Division':               '🇩🇰',
-
-  // Poland
-  'Ekstraklasa':                '🇵🇱',
-  'I Liga':                     '🇵🇱',
-
-  // Czech Republic
-  'Czech First League':         '🇨🇿',
-  'FNL':                        '🇨🇿',
-
-  // Serbia
-  'SuperLiga':                  '🇷🇸',
-  'First League':               '🇷🇸',
-
-  // Romania
-  'Liga 1':                     '🇷🇴',
-  'Liga 2':                     '🇷🇴',
-
-  // Croatia
-  'HNL':                        '🇭🇷',
-  'HNL 2':                      '🇭🇷',
-
-  // Africa
-  'NPFL':                       '🇳🇬',
-  'Egyptian Premier League':    '🇪🇬',
-  'Ligue Professionnelle 1':    '🌍',
-  'Botola Pro':                 '🇲🇦',
-  'Premier Soccer League':      '🇿🇦',
-  'Ghana Premier League':       '🇬🇭',
-
-  // Americas
-  'Brasileirão':                '🇧🇷',
-  'Serie D':                    '🇧🇷',
-  'Primera División':           '⚽',   // shared by many countries — fallback
-  'Primera Nacional':           '🇦🇷',
-  'Torneo Federal A':           '🇦🇷',
-  'Liga MX':                    '🇲🇽',
-  'MLS':                        '🇺🇸',
-  'Primera B':                  '🇨🇱',
-  'Categoría Primera A':        '🇨🇴',
-  'Categoría Primera B':        '🇨🇴',
-  'LigaPro':                    '🇪🇨',
-  'División Profesional':       '⚽',   // shared by Bolivia/Paraguay
-  'Saudi Pro League':           '🇸🇦',
-  'A-League':                   '🇦🇺',
-  'J1 League':                  '🇯🇵',
-  'K League 1':                 '🇰🇷',
-  'Indian Super League':        '🇮🇳',
-  'I-League':                   '🇮🇳',
-  'Chinese Super League':       '🇨🇳',
-  'Persian Gulf Pro League':    '🇮🇷',
-  'UAE Pro League':             '🇦🇪',
+  'Premiership':                '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
 }
 
-// Country-aware flag lookup — used to disambiguate leagues with shared names
 const COUNTRY_FLAGS: Record<string, string> = {
   'England':        '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
   'Scotland':       '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
@@ -136,18 +41,19 @@ const COUNTRY_FLAGS: Record<string, string> = {
   'Norway':         '🇳🇴',
   'Denmark':        '🇩🇰',
   'Poland':         '🇵🇱',
-  'Czech Republic': '🇨🇿',
+  'Czech-Republic': '🇨🇿',
   'Serbia':         '🇷🇸',
   'Romania':        '🇷🇴',
   'Croatia':        '🇭🇷',
+  'Russia':         '🇷🇺',
+  'Ukraine':        '🇺🇦',
+  'Austria':        '🇦🇹',
+  'Switzerland':    '🇨🇭',
   'Nigeria':        '🇳🇬',
   'Egypt':          '🇪🇬',
-  'Tunisia':        '🇹🇳',
-  'Algeria':        '🇩🇿',
   'Morocco':        '🇲🇦',
-  'South Africa':   '🇿🇦',
+  'South-Africa':   '🇿🇦',
   'Ghana':          '🇬🇭',
-  'Kenya':          '🇰🇪',
   'Brazil':         '🇧🇷',
   'Argentina':      '🇦🇷',
   'Mexico':         '🇲🇽',
@@ -156,24 +62,16 @@ const COUNTRY_FLAGS: Record<string, string> = {
   'Colombia':       '🇨🇴',
   'Ecuador':        '🇪🇨',
   'Uruguay':        '🇺🇾',
-  'Venezuela':      '🇻🇪',
-  'Bolivia':        '🇧🇴',
-  'Paraguay':       '🇵🇾',
-  'Saudi Arabia':   '🇸🇦',
-  'UAE':            '🇦🇪',
-  'Iran':           '🇮🇷',
-  'Iraq':           '🇮🇶',
-  'Lebanon':        '🇱🇧',
-  'Jordan':         '🇯🇴',
+  'Saudi-Arabia':   '🇸🇦',
+  'Qatar':          '🇶🇦',
   'Japan':          '🇯🇵',
-  'South Korea':    '🇰🇷',
+  'South-Korea':    '🇰🇷',
   'India':          '🇮🇳',
   'China':          '🇨🇳',
   'Australia':      '🇦🇺',
 }
 
 function getLeagueFlag(leagueName: string, country: string): string {
-  // Country-first lookup is more precise for shared league names
   return COUNTRY_FLAGS[country] ?? LEAGUE_FLAGS[leagueName] ?? '⚽'
 }
 
@@ -195,9 +93,8 @@ function RankBadge({ rank }: { rank: number }) {
 }
 
 function OddsBadge({ odds }: { odds: number }) {
-  const implied = impliedProbability(odds)  // raw implied (includes margin)
-  // Fair value estimate: remove ~6% average bookmaker margin
-  // fair% ≈ implied% / (1 + margin), rough approximation
+  if (!odds || odds <= 0) return null
+  const implied = impliedProbability(odds)
   const isSweet = odds >= 2.8 && odds <= 3.6
   return (
     <div className="flex flex-col items-end gap-0.5">
@@ -221,22 +118,33 @@ function OddsBadge({ odds }: { odds: number }) {
 
 export default async function HomePage() {
   const now = new Date()
-  const today = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`
+  // Use UTC date to match what the pipeline stores
+  const today = [
+    now.getUTCFullYear(),
+    String(now.getUTCMonth() + 1).padStart(2, '0'),
+    String(now.getUTCDate()).padStart(2, '0'),
+  ].join('-')
+
   const formattedDate = now.toLocaleDateString('en-GB', {
     weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+    timeZone: 'UTC',
   })
 
-  const { data: predictions } = await supabase
+  const { data: predictions, error } = await supabase
     .from('predictions')
     .select(`*, matches(*, leagues(name, country, avg_draw_rate, draw_boost))`)
     .eq('prediction_date', today)
     .order('rank', { ascending: true })
     .limit(10)
 
+  if (error) {
+    console.error('[homepage] predictions query error:', error.message)
+  }
+
   const preds = (predictions ?? []) as Prediction[]
 
   const avgConfidence = preds.length
-    ? Math.round(preds.reduce((s, p) => s + p.confidence, 0) / preds.length)
+    ? Math.round(preds.reduce((s, p) => s + (p.confidence ?? 0), 0) / preds.length)
     : 0
   const topConfidence = preds[0]?.confidence ?? 0
 
@@ -291,9 +199,9 @@ export default async function HomePage() {
 
           <div className="grid grid-cols-3 gap-4 mb-10">
             {[
-              { label: 'Matches analysed',       value: preds.length.toString() },
-              { label: 'Avg confidence',          value: `${avgConfidence}%` },
-              { label: 'Top pick confidence',     value: `${topConfidence}%` },
+              { label: 'Matches analysed',   value: preds.length.toString() },
+              { label: 'Avg confidence',      value: `${avgConfidence}%` },
+              { label: 'Top pick confidence', value: `${topConfidence}%` },
             ].map((stat) => (
               <div
                 key={stat.label}
@@ -313,17 +221,23 @@ export default async function HomePage() {
             style={{ background: 'var(--radar-surface)', border: '1px solid var(--radar-border)' }}
           >
             <p className="text-lg mb-2">No predictions yet for today</p>
-            <p className="text-sm" style={{ color: 'var(--radar-muted)' }}>
+            <p className="text-sm mb-4" style={{ color: 'var(--radar-muted)' }}>
               Predictions are generated daily at 07:00 UTC
+            </p>
+            <p className="text-xs" style={{ color: 'var(--radar-muted)' }}>
+              Date queried: <code>{today}</code>
             </p>
           </div>
         ) : (
           <div className="flex flex-col gap-3">
             {preds.map((pred) => {
               const m      = pred.matches
+              if (!m) return null
               const league = m.leagues
               const flag   = getLeagueFlag(league?.name ?? '', league?.country ?? '')
               const isTop3 = pred.rank <= 3
+              const drawScore = pred.draw_score ?? 0
+              const drawOdds  = pred.draw_odds ?? 0
 
               return (
                 <Link
@@ -351,7 +265,9 @@ export default async function HomePage() {
                           {league?.country ? ` · ${league.country}` : ''}
                         </span>
                         <span className="text-xs" style={{ color: 'var(--radar-muted)' }}>
-                          {new Date(m.match_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
+                          {new Date(m.match_date).toLocaleTimeString('en-GB', {
+                            hour: '2-digit', minute: '2-digit', timeZone: 'UTC'
+                          })}
                         </span>
                       </div>
                       <p className="font-semibold text-base truncate">
@@ -361,23 +277,25 @@ export default async function HomePage() {
                       </p>
                       <div className="mt-2 flex items-center gap-3">
                         <div className="flex-1 max-w-xs">
-                          <ConfidenceBar value={pred.confidence} />
+                          <ConfidenceBar value={pred.confidence ?? 0} />
                         </div>
                         <span className="text-xs font-medium" style={{ color: 'var(--radar-green)' }}>
-                          {pred.confidence}% confidence
+                          {pred.confidence ?? 0}% confidence
                         </span>
                       </div>
                     </div>
 
                     <div className="flex flex-col items-end gap-2 flex-shrink-0">
-                      <OddsBadge odds={pred.draw_odds} />
+                      {drawOdds > 0 && <OddsBadge odds={drawOdds} />}
                       <div className="flex items-center gap-1">
                         <span className="text-xs" style={{ color: 'var(--radar-muted)' }}>Score:</span>
                         <span
                           className="text-sm font-bold"
-                          style={{ color: pred.draw_score >= 8 ? '#00ff87' : pred.draw_score >= 6 ? '#f59e0b' : '#9ca3af' }}
+                          style={{
+                            color: drawScore >= 8 ? '#00ff87' : drawScore >= 6 ? '#f59e0b' : '#9ca3af'
+                          }}
                         >
-                          {pred.draw_score}/10
+                          {drawScore.toFixed(1)}/10
                         </span>
                       </div>
                     </div>
