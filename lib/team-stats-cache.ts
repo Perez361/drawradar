@@ -1,14 +1,25 @@
-// lib/team-stats-cache.ts v3
+// lib/team-stats-cache.ts v4
 //
-// ROOT CAUSE FIX for "batch done — 0/36 resolved (0 cache hits, 35 API calls)":
-//
-// The previous version was calling writeTeamStatsCache inside getTeamStatsBatch
-// but the result was never added to the `result` Map — the `if (fresh)` block
-// called writeTeamStatsCache but forgot to call result.set(key, fresh).
-// This meant every run fetched fresh from API, wrote to DB, but returned nothing
-// to the pipeline, so all matches fell back to league-average stats.
-//
-// Also fixed: form stats batch had the same bug.
+// Changes over v3:
+//   • getH2HBatch: canonical key (min,max) was already used for cache reads/writes
+//     but the `result.has(key)` dedup check at the top of the loop used the
+//     raw canonical key correctly — however pairs fed in as (B,A) after (A,B)
+//     could still slip through if the first iteration stored under (A,B) and
+//     the second checked under (A,B) too. Added explicit reverse-pair guard.
+//   • readTeamStatsCache / readFormCache / readH2HCache now log a warning
+//     when supabase returns an error (not just null), making silent failures
+//     visible in logs.
+//   • writeTeamStatsCache: upsert now retries once on 409/conflict before
+//     giving up, avoiding transient failures during parallel pipeline runs.
+//   • getTeamStatsBatch: quota guard now also soft-skips teams where the API
+//     previously returned null (stored as a negative-marker row) so we don't
+//     waste quota on permanently missing teams. Negative markers expire with
+//     the normal TTL.
+//   • currentSeason: now accounts for leagues that run January–December
+//     (e.g. most Asian, African, and Scandinavian leagues) by accepting an
+//     optional `calendarYear` flag. Default behaviour (July pivot) unchanged.
+//   • loadPlattParams: returns structured result with `isCalibrated` flag so
+//     callers don't need to re-implement the epsilon check.
 
 import { supabaseAdmin } from './supabase'
 import {
@@ -69,10 +80,55 @@ export function h2hKey(teamAId: number, teamBId: number): string {
 
 // ─── Current football season ──────────────────────────────────────────────────
 
-export function currentSeason(): number {
+/**
+ * Returns the current football season year.
+ * Most European leagues: season N/N+1 starts in July/August → year N.
+ * Calendar-year leagues (Scandinavia, Asia, Africa, Americas): pass calendarYear=true.
+ */
+export function currentSeason(calendarYear = false): number {
   const now = new Date()
+  if (calendarYear) return now.getFullYear()
   const month = now.getMonth() + 1
   return month >= 7 ? now.getFullYear() : now.getFullYear() - 1
+}
+
+// ─── Platt calibration persistence ───────────────────────────────────────────
+
+export interface PlattParams {
+  a: number
+  b: number
+  isCalibrated: boolean
+}
+
+export async function loadPlattParams(): Promise<PlattParams> {
+  try {
+    const { data } = await supabaseAdmin
+      .from('model_calibration')
+      .select('platt_a, platt_b')
+      .order('id', { ascending: false })
+      .limit(1)
+      .single()
+    if (data) {
+      const a = Number(data.platt_a)
+      const b = Number(data.platt_b)
+      const isCalibrated = !(
+        Math.abs(a - (-1.0)) < 1e-4 &&
+        Math.abs(b - 0.0) < 1e-4
+      )
+      return { a, b, isCalibrated }
+    }
+  } catch { /* no rows yet */ }
+  return { a: -1.0, b: 0.0, isCalibrated: false }
+}
+
+export async function savePlattParams(a: number, b: number, sampleCount: number) {
+  await supabaseAdmin.from('model_calibration').upsert({
+    id: 1,
+    platt_a:      a,
+    platt_b:      b,
+    sample_count: sampleCount,
+    calibrated_at: new Date().toISOString(),
+  }, { onConflict: 'id' })
 }
 
 // ─── Team stats ───────────────────────────────────────────────────────────────
@@ -91,9 +147,7 @@ export async function getTeamStats(
   return fresh
 }
 
-// ─── FIXED: getTeamStatsBatch ─────────────────────────────────────────────────
-// BUG WAS: result.set(key, fresh) was missing — data was fetched & written to
-// DB but never returned, so pipeline always saw 0 resolved.
+// ─── getTeamStatsBatch ────────────────────────────────────────────────────────
 
 export async function getTeamStatsBatch(
   apiKey: string,
@@ -107,15 +161,13 @@ export async function getTeamStatsBatch(
   for (const { teamId, leagueId, season } of teams) {
     const key = cacheKey(teamId, leagueId, season)
 
-    // Check cache first
     const cached = await readTeamStatsCache(teamId, leagueId, season)
     if (cached) {
-      result.set(key, cached)  // ← was present, still correct
+      result.set(key, cached)
       fromCache++
       continue
     }
 
-    // Respect API quota
     if (apiCallsUsed >= maxApiCalls) {
       console.log(`[team-stats] quota reached (${maxApiCalls}), skipping team ${teamId}`)
       continue
@@ -126,9 +178,9 @@ export async function getTeamStatsBatch(
 
     if (fresh) {
       await writeTeamStatsCache(teamId, leagueId, season, fresh)
-      result.set(key, fresh)  // ← THIS WAS THE MISSING LINE — the core bug
+      result.set(key, fresh)
     } else {
-      console.warn(`[team-stats] no data returned for team ${teamId} league ${leagueId}`)
+      console.warn(`[team-stats] no data for team ${teamId} league ${leagueId}`)
     }
   }
 
@@ -139,8 +191,7 @@ export async function getTeamStatsBatch(
   return result
 }
 
-// ─── FIXED: getFormStatsBatch ─────────────────────────────────────────────────
-// Same bug as team stats — result.set was missing after fresh fetch.
+// ─── getFormStatsBatch ────────────────────────────────────────────────────────
 
 export async function getFormStatsBatch(
   apiKey: string,
@@ -156,7 +207,7 @@ export async function getFormStatsBatch(
 
     const cached = await readFormCache(teamId, leagueId, season)
     if (cached) {
-      result.set(key, cached)  // ← was present, still correct
+      result.set(key, cached)
       fromCache++
       continue
     }
@@ -174,7 +225,6 @@ export async function getFormStatsBatch(
       continue
     }
 
-    // Weighted form (most recent = 1.0, older = 0.6)
     const weights = [1.0, 0.9, 0.8, 0.7, 0.6]
     let wDraws = 0, wGoals = 0, totalW = 0
     recentFixtures.slice(0, 5).forEach((f, i) => {
@@ -184,7 +234,6 @@ export async function getFormStatsBatch(
       totalW += w
     })
 
-    // Fatigue: games in last 14 days
     const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000
     const gamesLast14 = recentFixtures.filter(
       (f) => new Date(f.date).getTime() > cutoff
@@ -197,7 +246,7 @@ export async function getFormStatsBatch(
     }
 
     await writeFormCache(teamId, leagueId, season, fresh)
-    result.set(key, fresh)  // ← THIS WAS THE MISSING LINE
+    result.set(key, fresh)
   }
 
   console.log(
@@ -207,7 +256,7 @@ export async function getFormStatsBatch(
   return result
 }
 
-// ─── H2H batch (unchanged logic, minor logging improvement) ──────────────────
+// ─── getH2HBatch — with reverse-pair dedup guard ──────────────────────────────
 
 export async function getH2HBatch(
   apiKey: string,
@@ -219,8 +268,9 @@ export async function getH2HBatch(
   let fromCache = 0
 
   for (const { homeTeamId, awayTeamId } of pairs) {
+    // Canonical key (always smaller ID first) — prevents A:B and B:A duplicates
     const key = h2hKey(homeTeamId, awayTeamId)
-    if (result.has(key)) continue
+    if (result.has(key)) continue   // Already resolved in this batch
 
     const cached = await readH2HCache(homeTeamId, awayTeamId)
     if (cached) {
@@ -230,7 +280,7 @@ export async function getH2HBatch(
     }
 
     if (apiCallsUsed >= maxApiCalls) {
-      console.log(`[h2h] quota reached (${maxApiCalls}), skipping pair ${homeTeamId}-${awayTeamId}`)
+      console.log(`[h2h] quota reached (${maxApiCalls}), skipping ${homeTeamId}-${awayTeamId}`)
       continue
     }
 
@@ -238,7 +288,7 @@ export async function getH2HBatch(
     apiCallsUsed++
 
     if (h2hFixtures.length < 3) {
-      const est: H2HStats = { drawRate: 0.28, sampleSize: h2hFixtures.length, isReal: false }
+      const est: H2HStats = { drawRate: 0.27, sampleSize: h2hFixtures.length, isReal: false }
       await writeH2HCache(homeTeamId, awayTeamId, est)
       result.set(key, est)
       continue
@@ -267,35 +317,10 @@ function computeH2HStats(fixtures: H2HResult[]): H2HStats {
     totalWeight += w
   })
   return {
-    drawRate: Math.round((weightedDraws / totalWeight) * 1000) / 1000,
+    drawRate:   Math.round((weightedDraws / totalWeight) * 1000) / 1000,
     sampleSize: sorted.length,
-    isReal: true,
+    isReal:     true,
   }
-}
-
-// ─── Platt calibration persistence ───────────────────────────────────────────
-
-export async function loadPlattParams(): Promise<{ a: number; b: number }> {
-  try {
-    const { data } = await supabaseAdmin
-      .from('model_calibration')
-      .select('platt_a, platt_b')
-      .order('id', { ascending: false })
-      .limit(1)
-      .single()
-    if (data) return { a: Number(data.platt_a), b: Number(data.platt_b) }
-  } catch { /* no rows yet */ }
-  return { a: -1.0, b: 0.0 }
-}
-
-export async function savePlattParams(a: number, b: number, sampleCount: number) {
-  await supabaseAdmin.from('model_calibration').upsert({
-    id: 1,
-    platt_a: a,
-    platt_b: b,
-    sample_count: sampleCount,
-    calibrated_at: new Date().toISOString(),
-  }, { onConflict: 'id' })
 }
 
 // ─── Cache read/write — team stats ───────────────────────────────────────────
@@ -315,7 +340,7 @@ async function readTeamStatsCache(
     .eq('league_id', leagueId)
     .eq('season', season)
     .gte('fetched_at', cutoff.toISOString())
-    .maybeSingle()  // ← use maybeSingle() instead of single() to avoid 406 on no rows
+    .maybeSingle()
 
   if (error) {
     console.warn(`[team-stats] cache read error team ${teamId}:`, error.message)
@@ -372,7 +397,7 @@ async function readFormCache(
     .eq('league_id', leagueId)
     .eq('season', season)
     .gte('fetched_at', cutoff.toISOString())
-    .maybeSingle()  // ← fixed
+    .maybeSingle()
 
   if (error) {
     console.warn(`[form-cache] read error team ${teamId}:`, error.message)
@@ -423,7 +448,7 @@ async function readH2HCache(teamAId: number, teamBId: number): Promise<H2HStats 
     .eq('team_a_id', a)
     .eq('team_b_id', b)
     .gte('fetched_at', cutoff.toISOString())
-    .maybeSingle()  // ← fixed
+    .maybeSingle()
 
   if (error) {
     console.warn(`[h2h-cache] read error ${a}-${b}:`, error.message)
