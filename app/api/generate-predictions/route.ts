@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
-import { predictDraw } from '@/lib/drawEngine'
+import { predictDraw, type DrawFeatures } from '@/lib/drawEngine'
 
 export async function GET() {
   const today = new Date().toISOString().split('T')[0]
@@ -28,16 +28,26 @@ export async function GET() {
 
   // 3. Loop through matches
   for (const match of matches || []) {
-    if (!match.home_xg || !match.away_xg || !match.draw_odds) continue
+    if (!match.xg_home || !match.xg_away || !match.draw_odds) continue
 
-    const result = predictDraw({
-      home_xg: match.home_xg,
-      away_xg: match.away_xg,
-      home_odds: match.home_odds,
-      draw_odds: match.draw_odds,
-      away_odds: match.away_odds,
-      league_avg_draw_rate: match.leagues?.avg_draw_rate
-    })
+    const features: DrawFeatures = {
+      xgHome:           match.xg_home,
+      xgAway:           match.xg_away,
+      homeGoalsAvg:     match.home_goals_avg,
+      awayGoalsAvg:     match.away_goals_avg,
+      homeConcedeAvg:   match.home_concede_avg,
+      awayConcedeAvg:   match.away_concede_avg,
+      homeDrawRate:     match.home_draw_rate,
+      awayDrawRate:     match.away_draw_rate,
+      h2hDrawRate:      match.h2h_draw_rate,
+      h2hIsReal:        match.h2h_is_real ?? false,
+      drawOdds:         match.draw_odds,
+      homeOdds:         0,
+      awayOdds:         0,
+      leagueAvgDrawRate: match.leagues?.avg_draw_rate ?? 0.27,
+    }
+
+    const result = predictDraw(features)
 
     // 4. FILTER (CRITICAL)
     if (
@@ -47,12 +57,12 @@ export async function GET() {
       match.draw_odds <= 3.8
     ) {
       await supabase.from('predictions').insert({
-        match_id: match.id,
-        confidence: result.confidence,
-        draw_score: result.score,
-        edge: result.edge,
-        probability: result.probability,
-        prediction_date: today
+        match_id:        match.id,
+        confidence:      result.confidence,
+        draw_score:      result.drawScore,   // was result.score ❌
+        edge:            result.edge,
+        probability:     result.probability,
+        prediction_date: today,
       })
 
       saved++
@@ -61,6 +71,6 @@ export async function GET() {
 
   return NextResponse.json({
     message: 'Predictions generated',
-    saved
+    saved,
   })
 }
