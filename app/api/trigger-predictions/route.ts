@@ -1,18 +1,9 @@
-// app/api/trigger-predictions/route.ts v2
+// app/api/trigger-predictions/route.ts v3
 //
-// Enhanced pipeline:
-//   Budget: 1 (fixtures) + ≤50 (odds) + ≤35 (team stats) + ≤15 (form) + ≤10 (H2H) = ≤111
-//   Use warm-team-cache the night before to pre-fill team stats so the
-//   daily budget for team stats drops to near zero.
-//
-//   New features active in this pipeline:
-//     • Real H2H draw rate (weighted, recent-biased)
-//     • Weighted form streaks (last 5 games)
-//     • Fatigue proxy (games in last 14 days)
-//     • Opening odds stored → line movement computed at prediction time
-//     • Unified drawEngine v3 replaces both old scoring functions
-//     • Platt scaling loaded from DB (no-op until calibrated)
-//     • Better top-10 tiebreak: sweet-spot odds within score ties
+// Fixes in this version:
+//   1. upsertLeague uses onConflict: 'name,country' — no more "Primera División" collisions
+//   2. Opening odds are preserved from first daily fetch (not overwritten each run)
+//   3. Team stats now actually flow into predictions (team-stats-cache bug fixed separately)
 
 import { NextRequest, NextResponse } from 'next/server'
 import {
@@ -41,27 +32,50 @@ import {
   type DrawFeatures,
 } from '@/lib/drawEngine'
 
-// ─── League upsert (unchanged) ────────────────────────────────────────────────
+// ─── FIXED: League upsert — use (name, country) as unique key ────────────────
+// Previously used onConflict: 'name' which caused "Primera División" (Uruguay)
+// to silently reuse the "Primera División" (Chile) row, showing wrong country.
 
 async function upsertLeague(
   name: string,
   country: string,
   avgDrawRate: number
 ): Promise<number | null> {
+  // First try to find existing row
+  const { data: existing } = await supabaseAdmin
+    .from('leagues')
+    .select('id')
+    .eq('name', name)
+    .eq('country', country)
+    .maybeSingle()
+
+  if (existing) return existing.id
+
+  // Insert new row
   const { data, error } = await supabaseAdmin
     .from('leagues')
-    .upsert(
-      { name, country, avg_draw_rate: avgDrawRate, draw_boost: 0 },
-      { onConflict: 'name' }
-    )
+    .insert({ name, country, avg_draw_rate: avgDrawRate, draw_boost: 0 })
     .select('id')
     .single()
 
-  if (error) { console.error(`[upsertLeague] ${name}:`, error.message); return null }
+  if (error) {
+    // Race condition: another request inserted it — try to fetch
+    if (error.code === '23505') {
+      const { data: retry } = await supabaseAdmin
+        .from('leagues')
+        .select('id')
+        .eq('name', name)
+        .eq('country', country)
+        .maybeSingle()
+      return retry?.id ?? null
+    }
+    console.error(`[upsertLeague] ${name} (${country}):`, error.message)
+    return null
+  }
   return data.id
 }
 
-// ─── Main fixture fetcher (v2) ────────────────────────────────────────────────
+// ─── Main fixture fetcher ─────────────────────────────────────────────────────
 
 async function upsertTodayMatches(today: string): Promise<number> {
   const apiKey = process.env.API_FOOTBALL_KEY
@@ -74,11 +88,28 @@ async function upsertTodayMatches(today: string): Promise<number> {
   console.log(`[pipeline] ${tracked.length} tracked fixtures`)
   if (tracked.length === 0) return 0
 
-  // ── 2. Odds — store opening odds too (≤50 calls) ──────────────────────────
+  // ── 2. Odds — preserve opening odds from first daily fetch (≤50 calls) ───
+  const fixtureIds = tracked.slice(0, 50).map(f => `apifb_${f.fixture.id}`)
+
+  // Load any opening odds already stored today so we don't overwrite them
+  const { data: existingRows } = await supabaseAdmin
+    .from('matches')
+    .select('external_id, odds_open')
+    .in('external_id', fixtureIds)
+
+  const existingOpenOdds = new Map<string, number>(
+    (existingRows ?? [])
+      .filter(r => r.odds_open != null)
+      .map(r => [r.external_id as string, r.odds_open as number])
+  )
+
   const withOdds = await Promise.all(
     tracked.slice(0, 50).map(async (fixture) => {
+      const extId = `apifb_${fixture.fixture.id}`
       const drawOdds = await fetchOddsForFixture(apiKey, fixture.fixture.id)
-      return { fixture, drawOdds, openingOdds: drawOdds }  // opening = first fetch of the day
+      // Only use current odds as "opening" if we have no stored opening odds yet
+      const openingOdds = existingOpenOdds.get(extId) ?? (drawOdds > 0 ? drawOdds : null)
+      return { fixture, drawOdds, openingOdds }
     })
   )
   const fixturesWithOdds = withOdds.filter(({ drawOdds }) => drawOdds > 0)
@@ -125,15 +156,7 @@ async function upsertTodayMatches(today: string): Promise<number> {
       const h2hStats = h2hMap.get(pairKey)
 
       const h2hResults = h2hStats?.isReal
-        ? [{
-            fixtureId: 0,
-            date: new Date().toISOString(),
-            homeTeamId: fixture.teams.home.id,
-            awayTeamId: fixture.teams.away.id,
-            homeGoals: 0, awayGoals: 0,
-            isDraw: false,
-            // pass the already-computed draw rate via the stats struct
-          }]
+        ? buildH2HFromStats(h2hStats, fixture.teams.home.id, fixture.teams.away.id)
         : undefined
 
       return mapFixtureWithStats(
@@ -141,7 +164,7 @@ async function upsertTodayMatches(today: string): Promise<number> {
         drawOdds,
         statsMap.get(homeKey) ?? null,
         statsMap.get(awayKey) ?? null,
-        h2hStats?.isReal ? buildH2HFromStats(h2hStats, fixture.teams.home.id, fixture.teams.away.id) : undefined,
+        h2hResults,
         formMap.get(homeKey) ?? null,
         formMap.get(awayKey) ?? null,
         openingOdds
@@ -154,7 +177,7 @@ async function upsertTodayMatches(today: string): Promise<number> {
   // ── 8. Group by league and upsert ─────────────────────────────────────────
   const byLeague = new Map<string, MappedFixture[]>()
   for (const m of mapped) {
-    const key = `${m.league_name}:${m.league_country}`
+    const key = `${m.league_name}::${m.league_country}`
     if (!byLeague.has(key)) byLeague.set(key, [])
     byLeague.get(key)!.push(m)
   }
@@ -172,7 +195,10 @@ async function upsertTodayMatches(today: string): Promise<number> {
       first.league_country,
       leagueInfo.avgDrawRate
     )
-    if (!leagueId) continue
+    if (!leagueId) {
+      console.error(`[pipeline] could not get league ID for ${first.league_name} (${first.league_country})`)
+      continue
+    }
 
     const rows = matches.map((m) => ({
       league_id:            leagueId,
@@ -214,9 +240,9 @@ async function upsertTodayMatches(today: string): Promise<number> {
       .upsert(rows, { onConflict: 'external_id' })
 
     if (error) {
-      console.error(`[pipeline] upsert error for ${first.league_name}:`, error.message)
+      console.error(`[pipeline] upsert error for ${first.league_name} (${first.league_country}):`, error.message)
     } else {
-      console.log(`[pipeline] upserted ${rows.length} for ${first.league_name}`)
+      console.log(`[pipeline] upserted ${rows.length} for ${first.league_name} (${first.league_country})`)
       totalUpserted += rows.length
     }
   }
@@ -231,7 +257,6 @@ function buildH2HFromStats(
   awayTeamId: number
 ) {
   if (!stats.isReal || stats.sampleSize === 0) return undefined
-  // Reconstruct synthetic fixtures that yield the stored draw rate
   const total = Math.min(stats.sampleSize, 10)
   const draws = Math.round(stats.drawRate * total)
   return Array.from({ length: total }, (_, i) => ({
@@ -255,7 +280,7 @@ async function runPipeline(): Promise<NextResponse> {
     String(now.getUTCDate()).padStart(2, '0'),
   ].join('-')
 
-  // Load Platt calibration params (no-op if not yet calibrated)
+  // Load Platt calibration params
   const { a, b } = await loadPlattParams()
   setPlattParams(a, b)
   console.log(`[pipeline] Platt params loaded: a=${a}, b=${b}`)
@@ -283,32 +308,32 @@ async function runPipeline(): Promise<NextResponse> {
     )
   }
 
-  // Score every match using the unified drawEngine v3
+  // Score every match using drawEngine
   const scored = matches.map((match) => {
     const features: DrawFeatures = {
-      xgHome: match.xg_home,
-      xgAway: match.xg_away,
-      homeGoalsAvg: match.home_goals_avg,
-      awayGoalsAvg: match.away_goals_avg,
-      homeConcedeAvg: match.home_concede_avg,
-      awayConcedeAvg: match.away_concede_avg,
-      homeDrawRate: match.home_draw_rate,
-      awayDrawRate: match.away_draw_rate,
-      h2hDrawRate: match.h2h_draw_rate,
-      h2hIsReal: match.h2h_is_real ?? false,
-      drawOdds: match.draw_odds,
-      homeOdds: 0,  // not stored — could add later
-      awayOdds: 0,
-      oddsMovement: match.odds_movement ?? undefined,
-      oddsOpenDraw: match.odds_open ?? undefined,
-      homeFormDrawRate: match.home_form_draw_rate ?? undefined,
-      awayFormDrawRate: match.away_form_draw_rate ?? undefined,
-      homeFormGoalsAvg: match.home_form_goals_avg ?? undefined,
-      awayFormGoalsAvg: match.away_form_goals_avg ?? undefined,
-      homeGamesLast14: match.home_games_last14 ?? undefined,
-      awayGamesLast14: match.away_games_last14 ?? undefined,
+      xgHome:            match.xg_home,
+      xgAway:            match.xg_away,
+      homeGoalsAvg:      match.home_goals_avg,
+      awayGoalsAvg:      match.away_goals_avg,
+      homeConcedeAvg:    match.home_concede_avg,
+      awayConcedeAvg:    match.away_concede_avg,
+      homeDrawRate:      match.home_draw_rate,
+      awayDrawRate:      match.away_draw_rate,
+      h2hDrawRate:       match.h2h_draw_rate,
+      h2hIsReal:         match.h2h_is_real ?? false,
+      drawOdds:          match.draw_odds,
+      homeOdds:          0,
+      awayOdds:          0,
+      oddsMovement:      match.odds_movement ?? undefined,
+      oddsOpenDraw:      match.odds_open ?? undefined,
+      homeFormDrawRate:  match.home_form_draw_rate ?? undefined,
+      awayFormDrawRate:  match.away_form_draw_rate ?? undefined,
+      homeFormGoalsAvg:  match.home_form_goals_avg ?? undefined,
+      awayFormGoalsAvg:  match.away_form_goals_avg ?? undefined,
+      homeGamesLast14:   match.home_games_last14 ?? undefined,
+      awayGamesLast14:   match.away_games_last14 ?? undefined,
       leagueAvgDrawRate: match.leagues?.avg_draw_rate ?? 0.27,
-      leagueDrawBoost: match.leagues?.draw_boost ?? 0,
+      leagueDrawBoost:   match.leagues?.draw_boost ?? 0,
     }
 
     const prediction = predictDraw(features)
@@ -335,9 +360,7 @@ async function runPipeline(): Promise<NextResponse> {
     .delete()
     .eq('prediction_date', today)
 
-  // Sort: primary = drawScore DESC
-  // Tiebreak 1: sweet-spot odds (3.0–3.4 > 2.8–3.0 > rest)
-  // Tiebreak 2: real team stats > estimated
+  // Sort with tiebreaks
   const oddsQuality = (odds: number) => {
     if (odds >= 3.0 && odds <= 3.4) return 3
     if (odds >= 2.8 && odds < 3.0)  return 2

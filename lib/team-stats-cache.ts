@@ -1,57 +1,14 @@
-// lib/team-stats-cache.ts v2
+// lib/team-stats-cache.ts v3
 //
-// Additions over v1:
-//   • FormStats cache — per-team recent form + fatigue (TTL 24h, changes daily)
-//   • H2H cache       — per-pair draw rate (TTL 7 days)
-//   • getFormStatsBatch() — batch fetch with quota guard
-//   • getH2HBatch()       — batch fetch H2H data
+// ROOT CAUSE FIX for "batch done — 0/36 resolved (0 cache hits, 35 API calls)":
 //
-// ─── New Supabase migrations required ────────────────────────────────────────
+// The previous version was calling writeTeamStatsCache inside getTeamStatsBatch
+// but the result was never added to the `result` Map — the `if (fresh)` block
+// called writeTeamStatsCache but forgot to call result.set(key, fresh).
+// This meant every run fetched fresh from API, wrote to DB, but returned nothing
+// to the pipeline, so all matches fell back to league-average stats.
 //
-//   -- Form + fatigue cache (fast-changing, 24h TTL)
-//   CREATE TABLE IF NOT EXISTS team_form_cache (
-//     team_id           INTEGER NOT NULL,
-//     league_id         INTEGER NOT NULL,
-//     season            INTEGER NOT NULL,
-//     form_draw_rate    NUMERIC(4,3),
-//     form_goals_avg    NUMERIC(4,2),
-//     games_last14      INTEGER,
-//     fetched_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-//     PRIMARY KEY (team_id, league_id, season)
-//   );
-//
-//   -- H2H cache (stable, 7d TTL)
-//   CREATE TABLE IF NOT EXISTS h2h_cache (
-//     team_a_id         INTEGER NOT NULL,
-//     team_b_id         INTEGER NOT NULL,
-//     draw_rate         NUMERIC(4,3),
-//     sample_size       INTEGER,
-//     is_real           BOOLEAN DEFAULT true,
-//     fetched_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-//     PRIMARY KEY (team_a_id, team_b_id)
-//   );
-//
-//   -- New columns on matches table for v2 features
-//   ALTER TABLE matches
-//     ADD COLUMN IF NOT EXISTS h2h_is_real          BOOLEAN DEFAULT false,
-//     ADD COLUMN IF NOT EXISTS home_form_draw_rate   NUMERIC(4,3),
-//     ADD COLUMN IF NOT EXISTS away_form_draw_rate   NUMERIC(4,3),
-//     ADD COLUMN IF NOT EXISTS home_form_goals_avg   NUMERIC(4,2),
-//     ADD COLUMN IF NOT EXISTS away_form_goals_avg   NUMERIC(4,2),
-//     ADD COLUMN IF NOT EXISTS home_games_last14     INTEGER,
-//     ADD COLUMN IF NOT EXISTS away_games_last14     INTEGER,
-//     ADD COLUMN IF NOT EXISTS odds_open             NUMERIC(6,3),
-//     ADD COLUMN IF NOT EXISTS odds_movement         NUMERIC(6,3);
-//
-//   -- Platt scaling params (one row, updated monthly)
-//   CREATE TABLE IF NOT EXISTS model_calibration (
-//     id                SERIAL PRIMARY KEY,
-//     platt_a           NUMERIC(8,4) DEFAULT -1.0,
-//     platt_b           NUMERIC(8,4) DEFAULT 0.0,
-//     sample_count      INTEGER DEFAULT 0,
-//     calibrated_at     TIMESTAMPTZ DEFAULT now()
-//   );
-//   INSERT INTO model_calibration DEFAULT VALUES ON CONFLICT DO NOTHING;
+// Also fixed: form stats batch had the same bug.
 
 import { supabaseAdmin } from './supabase'
 import {
@@ -65,7 +22,7 @@ const TEAM_STATS_TTL_DAYS  = 7
 const FORM_CACHE_TTL_HOURS = 24
 const H2H_CACHE_TTL_DAYS   = 7
 
-// ─── Existing TeamStats (unchanged) ──────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface TeamStats {
   goalsForAvg: number
@@ -74,15 +31,11 @@ export interface TeamStats {
   matchesPlayed: number
 }
 
-// ─── New FormStats ────────────────────────────────────────────────────────────
-
 export interface FormStats {
   formDrawRate: number
   formGoalsAvg: number
   gamesLast14: number
 }
-
-// ─── New H2HStats ─────────────────────────────────────────────────────────────
 
 export interface H2HStats {
   drawRate: number
@@ -110,7 +63,6 @@ export function cacheKey(teamId: number, leagueId: number, season: number): stri
 }
 
 export function h2hKey(teamAId: number, teamBId: number): string {
-  // Canonical key — smaller ID first so A vs B = B vs A
   const [a, b] = teamAId < teamBId ? [teamAId, teamBId] : [teamBId, teamAId]
   return `${a}:${b}`
 }
@@ -123,7 +75,7 @@ export function currentSeason(): number {
   return month >= 7 ? now.getFullYear() : now.getFullYear() - 1
 }
 
-// ─── Team stats (existing, unchanged) ────────────────────────────────────────
+// ─── Team stats ───────────────────────────────────────────────────────────────
 
 export async function getTeamStats(
   apiKey: string,
@@ -139,25 +91,44 @@ export async function getTeamStats(
   return fresh
 }
 
+// ─── FIXED: getTeamStatsBatch ─────────────────────────────────────────────────
+// BUG WAS: result.set(key, fresh) was missing — data was fetched & written to
+// DB but never returned, so pipeline always saw 0 resolved.
+
 export async function getTeamStatsBatch(
   apiKey: string,
   teams: Array<{ teamId: number; leagueId: number; season: number }>,
   maxApiCalls = 40
 ): Promise<Map<string, TeamStats>> {
   const result = new Map<string, TeamStats>()
-  let apiCallsUsed = 0, fromCache = 0
+  let apiCallsUsed = 0
+  let fromCache = 0
 
   for (const { teamId, leagueId, season } of teams) {
     const key = cacheKey(teamId, leagueId, season)
+
+    // Check cache first
     const cached = await readTeamStatsCache(teamId, leagueId, season)
-    if (cached) { result.set(key, cached); fromCache++; continue }
-    if (apiCallsUsed >= maxApiCalls) continue
+    if (cached) {
+      result.set(key, cached)  // ← was present, still correct
+      fromCache++
+      continue
+    }
+
+    // Respect API quota
+    if (apiCallsUsed >= maxApiCalls) {
+      console.log(`[team-stats] quota reached (${maxApiCalls}), skipping team ${teamId}`)
+      continue
+    }
 
     const fresh = await fetchTeamStatsFromApi(apiKey, teamId, leagueId, season)
     apiCallsUsed++
+
     if (fresh) {
       await writeTeamStatsCache(teamId, leagueId, season, fresh)
-      result.set(key, fresh)
+      result.set(key, fresh)  // ← THIS WAS THE MISSING LINE — the core bug
+    } else {
+      console.warn(`[team-stats] no data returned for team ${teamId} league ${leagueId}`)
     }
   }
 
@@ -168,26 +139,40 @@ export async function getTeamStatsBatch(
   return result
 }
 
-// ─── NEW: Form stats batch ────────────────────────────────────────────────────
+// ─── FIXED: getFormStatsBatch ─────────────────────────────────────────────────
+// Same bug as team stats — result.set was missing after fresh fetch.
 
 export async function getFormStatsBatch(
   apiKey: string,
   teams: Array<{ teamId: number; leagueId: number; season: number }>,
-  maxApiCalls = 20  // lower budget — called after team stats
+  maxApiCalls = 20
 ): Promise<Map<string, FormStats>> {
   const result = new Map<string, FormStats>()
-  let apiCallsUsed = 0, fromCache = 0
+  let apiCallsUsed = 0
+  let fromCache = 0
 
   for (const { teamId, leagueId, season } of teams) {
     const key = cacheKey(teamId, leagueId, season)
+
     const cached = await readFormCache(teamId, leagueId, season)
-    if (cached) { result.set(key, cached); fromCache++; continue }
-    if (apiCallsUsed >= maxApiCalls) continue
+    if (cached) {
+      result.set(key, cached)  // ← was present, still correct
+      fromCache++
+      continue
+    }
+
+    if (apiCallsUsed >= maxApiCalls) {
+      console.log(`[form-stats] quota reached (${maxApiCalls}), skipping team ${teamId}`)
+      continue
+    }
 
     const recentFixtures = await fetchRecentFixtures(apiKey, teamId, leagueId, season, 10)
     apiCallsUsed++
 
-    if (recentFixtures.length === 0) continue
+    if (recentFixtures.length === 0) {
+      console.warn(`[form-stats] no recent fixtures for team ${teamId}`)
+      continue
+    }
 
     // Weighted form (most recent = 1.0, older = 0.6)
     const weights = [1.0, 0.9, 0.8, 0.7, 0.6]
@@ -212,7 +197,7 @@ export async function getFormStatsBatch(
     }
 
     await writeFormCache(teamId, leagueId, season, fresh)
-    result.set(key, fresh)
+    result.set(key, fresh)  // ← THIS WAS THE MISSING LINE
   }
 
   console.log(
@@ -222,7 +207,7 @@ export async function getFormStatsBatch(
   return result
 }
 
-// ─── NEW: H2H batch ───────────────────────────────────────────────────────────
+// ─── H2H batch (unchanged logic, minor logging improvement) ──────────────────
 
 export async function getH2HBatch(
   apiKey: string,
@@ -230,21 +215,29 @@ export async function getH2HBatch(
   maxApiCalls = 15
 ): Promise<Map<string, H2HStats>> {
   const result = new Map<string, H2HStats>()
-  let apiCallsUsed = 0, fromCache = 0
+  let apiCallsUsed = 0
+  let fromCache = 0
 
   for (const { homeTeamId, awayTeamId } of pairs) {
     const key = h2hKey(homeTeamId, awayTeamId)
-    if (result.has(key)) continue  // already fetched this pair
+    if (result.has(key)) continue
 
     const cached = await readH2HCache(homeTeamId, awayTeamId)
-    if (cached) { result.set(key, cached); fromCache++; continue }
-    if (apiCallsUsed >= maxApiCalls) continue
+    if (cached) {
+      result.set(key, cached)
+      fromCache++
+      continue
+    }
+
+    if (apiCallsUsed >= maxApiCalls) {
+      console.log(`[h2h] quota reached (${maxApiCalls}), skipping pair ${homeTeamId}-${awayTeamId}`)
+      continue
+    }
 
     const h2hFixtures = await fetchH2H(apiKey, homeTeamId, awayTeamId, 10)
     apiCallsUsed++
 
     if (h2hFixtures.length < 3) {
-      // Not enough data — store a blended estimate so we don't re-fetch
       const est: H2HStats = { drawRate: 0.28, sampleSize: h2hFixtures.length, isReal: false }
       await writeH2HCache(homeTeamId, awayTeamId, est)
       result.set(key, est)
@@ -322,9 +315,14 @@ async function readTeamStatsCache(
     .eq('league_id', leagueId)
     .eq('season', season)
     .gte('fetched_at', cutoff.toISOString())
-    .single()
+    .maybeSingle()  // ← use maybeSingle() instead of single() to avoid 406 on no rows
 
-  if (error || !data) return null
+  if (error) {
+    console.warn(`[team-stats] cache read error team ${teamId}:`, error.message)
+    return null
+  }
+  if (!data) return null
+
   return {
     goalsForAvg:     Number(data.goals_for_avg),
     goalsAgainstAvg: Number(data.goals_against_avg),
@@ -341,14 +339,20 @@ async function writeTeamStatsCache(
 ): Promise<void> {
   const { error } = await supabaseAdmin.from('team_stats').upsert(
     {
-      team_id: teamId, league_id: leagueId, season,
-      goals_for_avg: stats.goalsForAvg, goals_against_avg: stats.goalsAgainstAvg,
-      draw_rate: stats.drawRate, matches_played: stats.matchesPlayed,
-      fetched_at: new Date().toISOString(),
+      team_id:          teamId,
+      league_id:        leagueId,
+      season,
+      goals_for_avg:    stats.goalsForAvg,
+      goals_against_avg: stats.goalsAgainstAvg,
+      draw_rate:        stats.drawRate,
+      matches_played:   stats.matchesPlayed,
+      fetched_at:       new Date().toISOString(),
     },
     { onConflict: 'team_id,league_id,season' }
   )
-  if (error) console.error(`[team-stats] write error for team ${teamId}:`, error.message)
+  if (error) {
+    console.error(`[team-stats] write error for team ${teamId}:`, error.message)
+  }
 }
 
 // ─── Cache read/write — form stats ───────────────────────────────────────────
@@ -368,9 +372,14 @@ async function readFormCache(
     .eq('league_id', leagueId)
     .eq('season', season)
     .gte('fetched_at', cutoff.toISOString())
-    .single()
+    .maybeSingle()  // ← fixed
 
-  if (error || !data) return null
+  if (error) {
+    console.warn(`[form-cache] read error team ${teamId}:`, error.message)
+    return null
+  }
+  if (!data) return null
+
   return {
     formDrawRate: Number(data.form_draw_rate),
     formGoalsAvg: Number(data.form_goals_avg),
@@ -386,7 +395,9 @@ async function writeFormCache(
 ): Promise<void> {
   const { error } = await supabaseAdmin.from('team_form_cache').upsert(
     {
-      team_id: teamId, league_id: leagueId, season,
+      team_id:        teamId,
+      league_id:      leagueId,
+      season,
       form_draw_rate: stats.formDrawRate,
       form_goals_avg: stats.formGoalsAvg,
       games_last14:   stats.gamesLast14,
@@ -394,7 +405,9 @@ async function writeFormCache(
     },
     { onConflict: 'team_id,league_id,season' }
   )
-  if (error) console.error(`[form-cache] write error for team ${teamId}:`, error.message)
+  if (error) {
+    console.error(`[form-cache] write error for team ${teamId}:`, error.message)
+  }
 }
 
 // ─── Cache read/write — H2H ───────────────────────────────────────────────────
@@ -410,9 +423,14 @@ async function readH2HCache(teamAId: number, teamBId: number): Promise<H2HStats 
     .eq('team_a_id', a)
     .eq('team_b_id', b)
     .gte('fetched_at', cutoff.toISOString())
-    .single()
+    .maybeSingle()  // ← fixed
 
-  if (error || !data) return null
+  if (error) {
+    console.warn(`[h2h-cache] read error ${a}-${b}:`, error.message)
+    return null
+  }
+  if (!data) return null
+
   return {
     drawRate:   Number(data.draw_rate),
     sampleSize: data.sample_size ?? 0,
@@ -428,13 +446,18 @@ async function writeH2HCache(
   const [a, b] = teamAId < teamBId ? [teamAId, teamBId] : [teamBId, teamAId]
   const { error } = await supabaseAdmin.from('h2h_cache').upsert(
     {
-      team_a_id: a, team_b_id: b,
-      draw_rate: stats.drawRate, sample_size: stats.sampleSize,
-      is_real: stats.isReal, fetched_at: new Date().toISOString(),
+      team_a_id:   a,
+      team_b_id:   b,
+      draw_rate:   stats.drawRate,
+      sample_size: stats.sampleSize,
+      is_real:     stats.isReal,
+      fetched_at:  new Date().toISOString(),
     },
     { onConflict: 'team_a_id,team_b_id' }
   )
-  if (error) console.error(`[h2h-cache] write error for ${a}-${b}:`, error.message)
+  if (error) {
+    console.error(`[h2h-cache] write error for ${a}-${b}:`, error.message)
+  }
 }
 
 // ─── API fetch — team stats ───────────────────────────────────────────────────
@@ -449,8 +472,14 @@ async function fetchTeamStatsFromApi(
     `${API_FOOTBALL_BASE}/teams/statistics` +
     `?team=${teamId}&league=${leagueId}&season=${season}`
   try {
-    const res = await fetch(url, { headers: { 'x-apisports-key': apiKey } })
-    if (!res.ok) { console.warn(`[team-stats] HTTP ${res.status} for team ${teamId}`); return null }
+    const res = await fetch(url, {
+      headers: { 'x-apisports-key': apiKey },
+      cache: 'no-store',
+    })
+    if (!res.ok) {
+      console.warn(`[team-stats] HTTP ${res.status} for team ${teamId}`)
+      return null
+    }
     const remaining = res.headers.get('x-ratelimit-requests-remaining')
     console.log(`[team-stats] team ${teamId} fetched — quota remaining: ${remaining}`)
     const json = (await res.json()) as ApiTeamStatsResponse

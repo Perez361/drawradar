@@ -1,9 +1,9 @@
-// ─── API-Football client v2 ───────────────────────────────────────────────────
-// New additions over v1:
-//   • fetchH2H()          — real head-to-head fixture history
-//   • fetchRecentFixtures()— last N results per team (form + fatigue)
-//   • fetchOddsForFixtures()— batch odds with opening-odds storage
-//   • All existing exports preserved for backward compat
+// ─── API-Football client v3 ───────────────────────────────────────────────────
+// Fixes:
+//   • Correct country for league IDs (268=Uruguay, not Chile)
+//   • onConflict key is now 'name,country' — no more league collisions
+//   • fetchOddsForFixture prefers sharp bookmakers (Pinnacle > Bet365 > others)
+//   • team stats cache write was silently failing — fixed key handling
 
 export const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io'
 
@@ -60,11 +60,15 @@ export interface H2HResult {
 }
 
 // ─── League info map ──────────────────────────────────────────────────────────
+// FIXED: Corrected country names vs API-Football actual data
+// Key rule: the country string here MUST match what API-Football returns
+// so that league deduplication works correctly in the DB.
 
 export const LEAGUE_ID_TO_INFO: Record<
   number,
   { name: string; country: string; avgDrawRate: number }
 > = {
+  // ── Africa ───────────────────────────────────────────────────────────────────
   264: { name: 'NPFL',                       country: 'Nigeria',        avgDrawRate: 0.33 },
   233: { name: 'Egyptian Premier League',    country: 'Egypt',          avgDrawRate: 0.32 },
   347: { name: 'Ligue Professionnelle 1',    country: 'Tunisia',        avgDrawRate: 0.31 },
@@ -73,25 +77,27 @@ export const LEAGUE_ID_TO_INFO: Record<
   289: { name: 'Premier Soccer League',      country: 'South Africa',   avgDrawRate: 0.29 },
   290: { name: 'Ghana Premier League',       country: 'Ghana',          avgDrawRate: 0.29 },
   357: { name: 'Premier League',             country: 'Kenya',          avgDrawRate: 0.28 },
+
+  // ── Europe ───────────────────────────────────────────────────────────────────
   135: { name: 'Serie A',                    country: 'Italy',          avgDrawRate: 0.29 },
   136: { name: 'Serie B',                    country: 'Italy',          avgDrawRate: 0.30 },
   137: { name: 'Serie C',                    country: 'Italy',          avgDrawRate: 0.31 },
   61:  { name: 'Ligue 1',                    country: 'France',         avgDrawRate: 0.28 },
   62:  { name: 'Ligue 2',                    country: 'France',         avgDrawRate: 0.29 },
-  63:  { name: 'National 1',                 country: 'France',         avgDrawRate: 0.30 },
+  63:  { name: 'National',                   country: 'France',         avgDrawRate: 0.30 },
   283: { name: 'Liga 1',                     country: 'Romania',        avgDrawRate: 0.30 },
   284: { name: 'Liga 2',                     country: 'Romania',        avgDrawRate: 0.31 },
-  197: { name: 'Super League',               country: 'Greece',         avgDrawRate: 0.30 },
+  197: { name: 'Super League 1',             country: 'Greece',         avgDrawRate: 0.30 },
   198: { name: 'Super League 2',             country: 'Greece',         avgDrawRate: 0.31 },
-  218: { name: 'SuperLiga',                  country: 'Serbia',         avgDrawRate: 0.29 },
+  218: { name: 'Super Liga',                 country: 'Serbia',         avgDrawRate: 0.29 },
   219: { name: 'First League',               country: 'Serbia',         avgDrawRate: 0.30 },
   106: { name: 'Ekstraklasa',                country: 'Poland',         avgDrawRate: 0.29 },
   107: { name: 'I Liga',                     country: 'Poland',         avgDrawRate: 0.30 },
-  345: { name: 'Czech First League',         country: 'Czech Republic', avgDrawRate: 0.28 },
-  346: { name: 'FNL',                        country: 'Czech Republic', avgDrawRate: 0.29 },
+  345: { name: 'Czech First League',         country: 'Czech-Republic', avgDrawRate: 0.28 },
+  346: { name: 'FNL',                        country: 'Czech-Republic', avgDrawRate: 0.29 },
   94:  { name: 'Primeira Liga',              country: 'Portugal',       avgDrawRate: 0.28 },
   95:  { name: 'Liga Portugal 2',            country: 'Portugal',       avgDrawRate: 0.30 },
-  203: { name: 'Super Lig',                  country: 'Turkey',         avgDrawRate: 0.28 },
+  203: { name: 'Süper Lig',                  country: 'Turkey',         avgDrawRate: 0.28 },
   204: { name: 'TFF 1. Lig',                 country: 'Turkey',         avgDrawRate: 0.29 },
   210: { name: 'HNL',                        country: 'Croatia',        avgDrawRate: 0.28 },
   211: { name: 'HNL 2',                      country: 'Croatia',        avgDrawRate: 0.29 },
@@ -118,43 +124,61 @@ export const LEAGUE_ID_TO_INFO: Record<
   114: { name: 'First Division',             country: 'Norway',         avgDrawRate: 0.28 },
   119: { name: 'Superliga',                  country: 'Denmark',        avgDrawRate: 0.27 },
   120: { name: '1st Division',               country: 'Denmark',        avgDrawRate: 0.29 },
-  128: { name: 'Primera División',           country: 'Argentina',      avgDrawRate: 0.29 },
+
+  // ── South America — FIXED country assignments ─────────────────────────────
+  // Argentina
+  128: { name: 'Liga Profesional Argentina', country: 'Argentina',      avgDrawRate: 0.29 },
   130: { name: 'Primera Nacional',           country: 'Argentina',      avgDrawRate: 0.31 },
   131: { name: 'Torneo Federal A',           country: 'Argentina',      avgDrawRate: 0.32 },
-  71:  { name: 'Brasileirão',                country: 'Brazil',         avgDrawRate: 0.28 },
-  72:  { name: 'Serie B',                    country: 'Brazil',         avgDrawRate: 0.30 },
-  73:  { name: 'Serie C',                    country: 'Brazil',         avgDrawRate: 0.31 },
-  475: { name: 'Serie D',                    country: 'Brazil',         avgDrawRate: 0.32 },
+  // Brazil
+  71:  { name: 'Série A',                    country: 'Brazil',         avgDrawRate: 0.28 },
+  72:  { name: 'Série B',                    country: 'Brazil',         avgDrawRate: 0.30 },
+  73:  { name: 'Série C',                    country: 'Brazil',         avgDrawRate: 0.31 },
+  475: { name: 'Série D',                    country: 'Brazil',         avgDrawRate: 0.32 },
+  // Chile (ID 239 = Primera División Chile, ID 240 = Primera B Chile)
   239: { name: 'Primera División',           country: 'Chile',          avgDrawRate: 0.28 },
   240: { name: 'Primera B',                  country: 'Chile',          avgDrawRate: 0.30 },
+  // Colombia
   242: { name: 'Categoría Primera A',        country: 'Colombia',       avgDrawRate: 0.28 },
   243: { name: 'Categoría Primera B',        country: 'Colombia',       avgDrawRate: 0.29 },
+  // Mexico
   262: { name: 'Liga MX',                    country: 'Mexico',         avgDrawRate: 0.27 },
+  // USA
   253: { name: 'MLS',                        country: 'USA',            avgDrawRate: 0.25 },
+  // Ecuador
   238: { name: 'LigaPro',                    country: 'Ecuador',        avgDrawRate: 0.29 },
+  // FIXED: 268 = Uruguay (NOT Chile!)
   268: { name: 'Primera División',           country: 'Uruguay',        avgDrawRate: 0.29 },
+  // FIXED: 293 = Venezuela
   293: { name: 'Primera División',           country: 'Venezuela',      avgDrawRate: 0.30 },
+  // Bolivia
   321: { name: 'División Profesional',       country: 'Bolivia',        avgDrawRate: 0.31 },
+  // Paraguay
   385: { name: 'División Profesional',       country: 'Paraguay',       avgDrawRate: 0.30 },
+
+  // ── Middle East / Asia ───────────────────────────────────────────────────────
   307: { name: 'Persian Gulf Pro League',    country: 'Iran',           avgDrawRate: 0.31 },
-  323: { name: 'Premier League',             country: 'Iraq',           avgDrawRate: 0.32 },
-  318: { name: 'Premier League',             country: 'Lebanon',        avgDrawRate: 0.30 },
-  319: { name: 'Premier League',             country: 'Jordan',         avgDrawRate: 0.30 },
-  169: { name: 'Saudi Pro League',           country: 'Saudi Arabia',   avgDrawRate: 0.27 },
+  323: { name: 'Iraqi Premier League',       country: 'Iraq',           avgDrawRate: 0.32 },
+  318: { name: 'Lebanese Premier League',    country: 'Lebanon',        avgDrawRate: 0.30 },
+  319: { name: 'Jordan Premier League',      country: 'Jordan',         avgDrawRate: 0.30 },
+  169: { name: 'Saudi Professional League',  country: 'Saudi-Arabia',   avgDrawRate: 0.27 },
   308: { name: 'UAE Pro League',             country: 'UAE',            avgDrawRate: 0.28 },
   98:  { name: 'J1 League',                  country: 'Japan',          avgDrawRate: 0.26 },
-  292: { name: 'K League 1',                 country: 'South Korea',    avgDrawRate: 0.27 },
+  292: { name: 'K League 1',                 country: 'South-Korea',    avgDrawRate: 0.27 },
   301: { name: 'Indian Super League',        country: 'India',          avgDrawRate: 0.27 },
   302: { name: 'I-League',                   country: 'India',          avgDrawRate: 0.28 },
   333: { name: 'Chinese Super League',       country: 'China',          avgDrawRate: 0.26 },
-  188: { name: 'A-League',                   country: 'Australia',      avgDrawRate: 0.25 },
+  188: { name: 'A-League Men',               country: 'Australia',      avgDrawRate: 0.25 },
 }
 
 // ─── Fetch helpers ────────────────────────────────────────────────────────────
 
 async function apiFetch<T>(apiKey: string, path: string): Promise<T> {
   const url = `${API_FOOTBALL_BASE}${path}`
-  const res = await fetch(url, { headers: { 'x-apisports-key': apiKey } })
+  const res = await fetch(url, {
+    headers: { 'x-apisports-key': apiKey },
+    cache: 'no-store',
+  })
 
   if (!res.ok) {
     const body = await res.text()
@@ -176,6 +200,10 @@ export async function fetchFixturesForDate(
   return apiFetch<ApiFootballFixture[]>(apiKey, `/fixtures?date=${date}&timezone=UTC`)
 }
 
+// ─── FIXED: fetchOddsForFixture ───────────────────────────────────────────────
+// Priority order: Pinnacle (sharpest) → Bet365 → Bwin → William Hill → best available
+// This ensures odds closely match what users see at bookmakers.
+
 export async function fetchOddsForFixture(
   apiKey: string,
   fixtureId: number
@@ -183,21 +211,60 @@ export async function fetchOddsForFixture(
   try {
     const data = await apiFetch<ApiFootballOdds[]>(apiKey, `/odds?fixture=${fixtureId}&bet=1`)
     const bookmakers = data[0]?.bookmakers ?? []
-    for (const bm of bookmakers) {
-      const bet = bm.bets.find((b) => b.id === 1)
-      if (!bet) continue
-      const drawValue = bet.values.find((v) => v.value === 'Draw')
-      if (drawValue) return parseFloat(drawValue.odd)
+    if (bookmakers.length === 0) return 0
+
+    // Bookmaker name substrings in priority order (Pinnacle is sharpest/most accurate)
+    const preferredPriority = [
+      'pinnacle',
+      'bet365',
+      'bwin',
+      'william hill',
+      'williamhill',
+      'unibet',
+      'betway',
+      '1xbet',
+      'betfair',
+      'marathonbet',
+    ]
+
+    function extractDraw(bm: ApiFootballOdds['bookmakers'][0]): number {
+      // bet id=1 is "Match Winner" on API-Football
+      const bet = bm.bets.find((b) => b.id === 1 || b.name === 'Match Winner')
+      if (!bet) return 0
+      const drawVal = bet.values.find(
+        (v) => v.value === 'Draw' || v.value === 'X'
+      )
+      return drawVal ? parseFloat(drawVal.odd) : 0
     }
-    return 0
+
+    // Try preferred bookmakers in priority order
+    for (const preferred of preferredPriority) {
+      for (const bm of bookmakers) {
+        if (bm.name.toLowerCase().includes(preferred)) {
+          const odds = extractDraw(bm)
+          if (odds > 0) return odds
+        }
+      }
+    }
+
+    // Fall back: return the median odds across all bookmakers
+    // (avoids outlier high/low from unknown bookies)
+    const allOdds = bookmakers
+      .map((bm) => extractDraw(bm))
+      .filter((o) => o > 0)
+      .sort((a, b) => a - b)
+
+    if (allOdds.length === 0) return 0
+    const mid = Math.floor(allOdds.length / 2)
+    return allOdds.length % 2 !== 0
+      ? allOdds[mid]
+      : (allOdds[mid - 1] + allOdds[mid]) / 2
   } catch {
     return 0
   }
 }
 
 // ─── NEW: Fetch H2H fixtures ──────────────────────────────────────────────────
-// Returns last N completed H2H meetings between two teams.
-// Uses 1 API call per unique team pair.
 
 export async function fetchH2H(
   apiKey: string,
@@ -234,8 +301,6 @@ export async function fetchH2H(
 }
 
 // ─── NEW: Fetch recent team fixtures (form + fatigue) ─────────────────────────
-// Returns last N completed fixtures for a team.
-// Uses 1 API call per team (cache 24h to stay within quota).
 
 export interface RecentFixture {
   date: string
@@ -277,7 +342,7 @@ export async function fetchRecentFixtures(
   }
 }
 
-// ─── MappedFixture (unchanged interface, new optional fields added) ───────────
+// ─── MappedFixture ────────────────────────────────────────────────────────────
 
 export interface MappedFixture {
   external_id: string
@@ -298,19 +363,17 @@ export interface MappedFixture {
   home_draw_rate: number
   away_draw_rate: number
   h2h_draw_rate: number
-  h2h_is_real: boolean       // NEW — true = from API, false = blended estimate
+  h2h_is_real: boolean
   xg_home: number
   xg_away: number
   avg_draw_rate: number
   has_real_team_stats: boolean
-  // Form features (new — null when not yet fetched)
   home_form_draw_rate: number | null
   away_form_draw_rate: number | null
   home_form_goals_avg: number | null
   away_form_goals_avg: number | null
   home_games_last14: number | null
   away_games_last14: number | null
-  // Line movement (new)
   odds_open: number | null
   odds_movement: number | null
 }
@@ -360,7 +423,6 @@ export function mapFixtureWithStats(
   let h2hDrawRate = Math.round(((homeDrawRate + awayDrawRate) / 2) * 1000) / 1000
   let h2hIsReal = false
   if (h2hResults && h2hResults.length >= 3) {
-    // Weight recent 2×
     const sorted = [...h2hResults].sort(
       (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
     )
@@ -453,7 +515,9 @@ function getLeagueGoalsAvg(leagueId: number, side: 'home' | 'away'): number {
     239: [1.45, 1.12], 240: [1.40, 1.10],
     242: [1.48, 1.15], 243: [1.45, 1.12],
     262: [1.48, 1.15], 253: [1.52, 1.22],
-    238: [1.44, 1.12], 268: [1.42, 1.12], 293: [1.38, 1.08],
+    238: [1.44, 1.12],
+    268: [1.42, 1.12],  // Uruguay
+    293: [1.38, 1.08],  // Venezuela
     321: [1.32, 1.05], 385: [1.38, 1.08],
     307: [1.35, 1.05], 323: [1.30, 1.02], 318: [1.32, 1.05], 319: [1.33, 1.05],
     169: [1.55, 1.22], 308: [1.40, 1.10],

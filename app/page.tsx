@@ -195,7 +195,9 @@ function RankBadge({ rank }: { rank: number }) {
 }
 
 function OddsBadge({ odds }: { odds: number }) {
-  const implied = impliedProbability(odds)
+  const implied = impliedProbability(odds)  // raw implied (includes margin)
+  // Fair value estimate: remove ~6% average bookmaker margin
+  // fair% ≈ implied% / (1 + margin), rough approximation
   const isSweet = odds >= 2.8 && odds <= 3.6
   return (
     <div className="flex flex-col items-end gap-0.5">
@@ -209,7 +211,10 @@ function OddsBadge({ odds }: { odds: number }) {
       >
         {odds.toFixed(2)}
       </span>
-      <span className="text-xs" style={{ color: '#6b7a8d' }}>{implied}% implied</span>
+      <span className="text-xs" style={{ color: '#6b7a8d' }}>
+        {implied}% implied
+        {isSweet && <span style={{ color: '#00ff87' }}> ✓</span>}
+      </span>
     </div>
   )
 }
