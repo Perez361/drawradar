@@ -1,13 +1,11 @@
-# TODO: drawradar
+# DrawRadar TODO - Accuracy Tracking Progress
 
-✓ GitHub repo created: https://github.com/Perez361/drawradar
-
-# Date-specific predictions ✓
-Use ?date=2026-03-23 on /api/predictions & /api/trigger-predictions (default today).
-Odds API fetches for any date (e.g., future).
-
-- [x] 1. Edit app/api/predictions/route.ts ✓
-- [x] 2. Edit app/api/trigger-predictions/route.ts ✓
-- [x] 3. Update lib/odds-api.ts: fetchMatchesForDate(dateFrom, dateTo) ✓
-- [ ] 4. Test locally
-- [ ] 5. Commit/push changes
+## Approved Plan Implementation
+- [x] 1. Create TODO.md with steps
+- [x] 2. User creates Supabase function `update_predictions_accuracy()`
+- [x] 3. Create `app/api/admin/update-accuracy/route.ts`
+- [x] 4. Create `app/api/model-accuracy/route.ts`
+- [x] 5. Read & edit `app/admin/page.tsx` to add metrics
+- [ ] 6. Test APIs
+- [ ] 7. Update TODO.md complete
+- [ ] 8. Add Vercel cron

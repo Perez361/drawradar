@@ -26,6 +26,8 @@ export default function AdminPage() {
   const [status, setStatus]           = useState<Status>('idle')
   const [result, setResult]           = useState<PipelineResult | null>(null)
   const [logs, setLogs]               = useState<LogLine[]>([])
+  const [accuracy, setAccuracy]       = useState<any>(null)
+  const [accStatus, setAccStatus]     = useState<Status>('idle')
   const [clearStatus, setClearStatus] = useState<Status>('idle')
 
   function addLog(msg: string, type: LogLine['type'] = 'info') {
@@ -83,6 +85,34 @@ export default function AdminPage() {
       const msg = err instanceof Error ? err.message : String(err)
       addLog(`Network error: ${msg}`, 'error')
       setClearStatus('error')
+    }
+  }
+
+  async function loadAccuracy() {
+    setAccStatus('loading')
+    try {
+      const res = await fetch('/api/model-accuracy')
+      const data = await res.json()
+      setAccuracy(data)
+      setAccStatus('success')
+    } catch {
+      setAccStatus('error')
+    }
+  }
+
+  async function updateAccuracy() {
+    setAccStatus('loading')
+    try {
+      const res = await fetch('/api/admin/update-accuracy', { method: 'POST' })
+      if (res.ok) {
+        addLog('Accuracy updated ✓')
+        loadAccuracy()
+      } else {
+        addLog('Update failed', 'error')
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      addLog(`Error: ${msg}`, 'error')
     }
   }
 
@@ -144,6 +174,75 @@ export default function AdminPage() {
           className="rounded-xl p-6"
           style={{ background: 'var(--radar-surface)', border: '1px solid var(--radar-border)' }}
         >
+
+        {/* Accuracy Section */}
+        <section
+          className="rounded-xl p-6"
+          style={{ background: 'var(--radar-surface)', border: '1px solid var(--radar-border)' }}
+        >
+          <h2 className="font-semibold mb-1 flex items-center gap-2">
+            Model Accuracy
+            <button
+              onClick={loadAccuracy}
+              disabled={accStatus === 'loading'}
+              className="text-xs px-2 py-0.5 rounded font-medium"
+              style={{
+                background: 'rgba(0,255,135,0.1)',
+                color: 'var(--radar-green)',
+                border: '1px solid rgba(0,255,135,0.3)'
+              }}
+            >
+              {accStatus === 'loading' ? 'Loading…' : '↻'}
+            </button>
+          </h2>
+          <div className="grid grid-cols-2 gap-4 mt-4">
+            <div>
+              <button
+                onClick={updateAccuracy}
+                disabled={accStatus === 'loading'}
+                className="w-full px-3 py-1.5 rounded text-xs font-medium mb-2"
+                style={{
+                  background: 'rgba(59,130,246,0.1)',
+                  color: '#60a5fa',
+                  border: '1px solid rgba(59,130,246,0.3)'
+                }}
+              >
+                Update Accuracy (POST)
+              </button>
+              {accuracy ? (
+                <>
+                  <div style={{ background: 'var(--radar-bg)', padding: '0.75rem', borderRadius: '0.5rem', marginBottom: '0.5rem' }}>
+                    <p className="text-sm font-mono" style={{ color: 'var(--radar-green)' }}>Hit Rate: {accuracy.hitRate}%</p>
+                    <p className="text-xs" style={{ color: 'var(--radar-muted)' }}>High Conf (≥70%): {accuracy.highConfHitRate}%</p>
+                  </div>
+                  <p className="text-xs" style={{ color: 'var(--radar-muted)' }}>
+                    {accuracy.totalEvaluated} evaluated, {accuracy.unevaluated} pending
+                  </p>
+                </>
+              ) : (
+                <p className="text-sm" style={{ color: 'var(--radar-muted)' }}>Click refresh</p>
+              )}
+            </div>
+            <div>
+              <details className="text-xs">
+                <summary>SQL Function (run once in Supabase Dashboard)</summary>
+                <pre className="mt-2 p-2 bg-black/20 rounded text-xs overflow-auto max-h-32 font-mono">
+{`CREATE OR REPLACE FUNCTION update_predictions_accuracy()
+RETURNS void AS $$
+BEGIN
+  UPDATE predictions p
+  SET was_correct = (m.result = 'D')
+  FROM matches m 
+  WHERE p.match_id = m.id 
+    AND m.status NOT IN ('scheduled','NS','TBD')
+    AND p.was_correct IS NULL;
+END;
+$$ LANGUAGE plpgsql;`}
+                </pre>
+              </details>
+            </div>
+          </div>
+        </section>
           <h2 className="font-semibold mb-1">Step 2 — Fetch today's matches &amp; generate predictions</h2>
           <p className="text-sm mb-4" style={{ color: 'var(--radar-muted)' }}>
             Calls The Odds API for today's fixtures across all supported leagues, scores them,
