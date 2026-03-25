@@ -75,6 +75,21 @@ interface AllSportsResult {
   error?: string
 }
 
+interface TSDBResult {
+  success?: boolean
+  date?: string
+  matchesFound?: number
+  leaguesProcessed?: number
+  teamsCoveredByTable?: number
+  enriched?: number
+  skipped?: number
+  leagueDrawRatesUpdated?: number
+  requestsUsed?: number
+  budget?: { used: number; remaining: number; resetIn: number }
+  message?: string
+  error?: string
+}
+
 export default function AdminPage() {
   const [status, setStatus]           = useState<Status>('idle')
   const [result, setResult]           = useState<PipelineResult | null>(null)
@@ -87,6 +102,8 @@ export default function AdminPage() {
   const [showLeague, setShowLeague]   = useState(false)
   const [asStatus, setAsStatus]       = useState<Status>('idle')
   const [asResult, setAsResult]       = useState<AllSportsResult | null>(null)
+  const [tsdbStatus, setTsdbStatus]   = useState<Status>('idle')
+  const [tsdbResult, setTsdbResult]   = useState<TSDBResult | null>(null)
 
   function addLog(msg: string, type: LogLine['type'] = 'info') {
     const ts = new Date().toLocaleTimeString('en-GB')
@@ -159,6 +176,32 @@ export default function AdminPage() {
     }
   }
 
+  async function runTSDBEnrich() {
+    setTsdbStatus('loading')
+    setTsdbResult(null)
+    addLog('Running TheSportsDB enrichment (standings → real draw rates) …')
+    try {
+      const res  = await fetch('/api/admin/tsdb-enrich')
+      const data = await res.json() as TSDBResult
+      setTsdbResult(data)
+      if (data.error) {
+        addLog(`TSDB error: ${data.error}`, 'error')
+        setTsdbStatus('error')
+      } else {
+        addLog(
+          `TSDB done — enriched: ${data.enriched ?? 0} matches across ` +
+          `${data.leaguesProcessed ?? 0} leagues (${data.teamsCoveredByTable ?? 0} teams covered, ` +
+          `${data.requestsUsed ?? 0} API calls used)`,
+          'success'
+        )
+        setTsdbStatus('success')
+      }
+    } catch (err) {
+      addLog(`TSDB network error: ${err instanceof Error ? err.message : String(err)}`, 'error')
+      setTsdbStatus('error')
+    }
+  }
+
   async function loadAccuracy() {
     setAccStatus('loading')
     try {
@@ -214,27 +257,31 @@ export default function AdminPage() {
     info: '#6b7a8d', success: '#00ff87', error: '#ef4444',
   }
 
-  const surface  = 'var(--radar-surface)'
-  const border   = 'var(--radar-border)'
-  const muted    = 'var(--radar-muted)'
-  const green    = 'var(--radar-green)'
-  const orange   = '#fb923c'
+  const surface = 'var(--radar-surface)'
+  const border  = 'var(--radar-border)'
+  const muted   = 'var(--radar-muted)'
+  const green   = 'var(--radar-green)'
+  const orange  = '#fb923c'
+  const teal    = '#2dd4bf'
 
   const buildSignalRows = (si: AccuracyData['signalImpact']) => {
-    const rows: Array<{ label: string; count: number; hitRate: number | null; range?: string }> = [
-      { label: 'Real H2H data', ...si.realH2H },
-      { label: 'Estimated H2H', ...si.estimatedH2H },
-      { label: 'With form data', ...si.withForm },
-      { label: 'Without form', ...si.withoutForm },
+    const rows: Array<{ label: string; count: number; hitRate: number | null }> = [
+      { label: 'Real H2H data',   ...si.realH2H },
+      { label: 'Estimated H2H',   ...si.estimatedH2H },
+      { label: 'With form data',  ...si.withForm },
+      { label: 'Without form',    ...si.withoutForm },
     ]
-    if (si.fatigueHigh) {
-      rows.push({ label: si.fatigueHigh.label ?? 'Avg ≥3 games/14d', ...si.fatigueHigh })
-    }
-    if (si.realTeamStats) {
-      rows.push({ label: 'Real team stats', ...si.realTeamStats })
-    }
+    if (si.fatigueHigh)   rows.push({ label: si.fatigueHigh.label ?? 'Avg ≥3 games/14d', ...si.fatigueHigh })
+    if (si.realTeamStats) rows.push({ label: 'Real team stats', ...si.realTeamStats })
     return rows
   }
+
+  // ── Cron timeline helper ────────────────────────────────────────────────────
+  const cronSteps = [
+    { time: '06:00', label: 'AllSportsAPI', color: orange, step: '1b' },
+    { time: '06:30', label: 'TSDB Enrich',  color: teal,   step: '1c' },
+    { time: '07:00', label: 'Main pipeline', color: green, step: '2'  },
+  ]
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--radar-bg)', color: 'var(--radar-text)' }}>
@@ -251,6 +298,25 @@ export default function AdminPage() {
       </header>
 
       <main className="max-w-3xl mx-auto px-4 py-10 flex flex-col gap-6">
+
+        {/* Daily cron timeline */}
+        <section className="rounded-xl p-4" style={{ background: surface, border: `1px solid ${border}` }}>
+          <p className="text-xs font-semibold mb-3 uppercase tracking-wider" style={{ color: muted }}>Daily cron schedule (UTC)</p>
+          <div className="flex items-center gap-0">
+            {cronSteps.map((s, i) => (
+              <div key={s.step} className="flex items-center gap-0 flex-1">
+                <div className="flex flex-col items-center">
+                  <div className="w-2 h-2 rounded-full" style={{ background: s.color }} />
+                  <p className="text-xs font-mono mt-1" style={{ color: s.color }}>{s.time}</p>
+                  <p className="text-xs mt-0.5" style={{ color: muted }}>{s.label}</p>
+                </div>
+                {i < cronSteps.length - 1 && (
+                  <div className="flex-1 h-px mx-2" style={{ background: border }} />
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
 
         {/* Step 1 — Clear */}
         <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
@@ -276,39 +342,31 @@ export default function AdminPage() {
             Step 1b — Fetch AllSportsAPI fixtures
             <span className="text-xs px-2 py-0.5 rounded font-normal"
               style={{ background: 'rgba(251,146,60,0.12)', color: orange, border: '1px solid rgba(251,146,60,0.3)' }}>
-              SUPPLEMENTARY
+              06:00 UTC
             </span>
           </h2>
-          <p className="text-sm mb-1" style={{ color: muted }}>
-            Supplements today's match pool with fixtures + draw odds from AllSportsAPI
-            (<code>apiv2.allsportsapi.com</code>). Runs at <strong>06:00 UTC</strong> automatically,
-            1 hour before the main pipeline.
+          <p className="text-sm mb-4" style={{ color: muted }}>
+            Pulls today's fixtures + draw odds from <code>apiv2.allsportsapi.com</code>.
+            Stores as <code>external_id = "allsp_*"</code>. Uses league baselines for stats — enriched in Step 1c.
           </p>
-          <p className="text-xs mb-4" style={{ color: muted }}>
-            Uses <code>ALLSPORTS_API_KEY</code> env var. Stores matches as{' '}
-            <code>external_id = "allsp_&lt;match_id&gt;"</code> to avoid collisions with API-Football rows.
-            Stats use league baselines (no team-level data from AllSports).
-          </p>
-          <div className="flex gap-3 items-center flex-wrap">
-            <button onClick={fetchAllSports} disabled={asStatus === 'loading'}
-              className="px-5 py-2 rounded font-medium text-sm transition-all"
-              style={{
-                background: asStatus === 'loading' ? 'rgba(255,255,255,0.05)' : 'rgba(251,146,60,0.1)',
-                color: asStatus === 'loading' ? muted : orange,
-                border: `1px solid ${asStatus === 'loading' ? border : 'rgba(251,146,60,0.35)'}`,
-                cursor: asStatus === 'loading' ? 'not-allowed' : 'pointer',
-              }}>
-              {asStatus === 'loading' ? 'Fetching…' : asStatus === 'success' ? 'Fetched ✓' : '⚡ Fetch AllSports'}
-            </button>
-          </div>
+          <button onClick={fetchAllSports} disabled={asStatus === 'loading'}
+            className="px-5 py-2 rounded font-medium text-sm transition-all"
+            style={{
+              background: asStatus === 'loading' ? 'rgba(255,255,255,0.05)' : 'rgba(251,146,60,0.1)',
+              color: asStatus === 'loading' ? muted : orange,
+              border: `1px solid ${asStatus === 'loading' ? border : 'rgba(251,146,60,0.35)'}`,
+              cursor: asStatus === 'loading' ? 'not-allowed' : 'pointer',
+            }}>
+            {asStatus === 'loading' ? 'Fetching…' : asStatus === 'success' ? 'Fetched ✓' : '⚡ Fetch AllSports'}
+          </button>
 
           {asResult && asStatus === 'success' && (
             <div className="mt-3 grid grid-cols-4 gap-2">
               {[
-                { label: 'API total',   value: asResult.fetched ?? 0 },
-                { label: 'Tracked',     value: asResult.tracked ?? 0 },
-                { label: 'Upserted',    value: asResult.upserted ?? 0 },
-                { label: 'No odds',     value: asResult.skippedNoOdds ?? 0 },
+                { label: 'API total', value: asResult.fetched ?? 0 },
+                { label: 'Tracked',   value: asResult.tracked ?? 0 },
+                { label: 'Upserted',  value: asResult.upserted ?? 0 },
+                { label: 'No odds',   value: asResult.skippedNoOdds ?? 0 },
               ].map((s) => (
                 <div key={s.label} className="rounded-lg p-2 text-center" style={{ background: 'var(--radar-bg)' }}>
                   <p className="text-base font-bold" style={{ color: orange }}>{s.value}</p>
@@ -325,18 +383,88 @@ export default function AdminPage() {
           )}
         </section>
 
-        {/* Step 2 — Pipeline */}
+        {/* Step 1c — TheSportsDB Enrichment */}
         <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
-          <h2 className="font-semibold mb-1">Step 2 — Run enhanced pipeline</h2>
+          <h2 className="font-semibold mb-1 flex items-center gap-2">
+            Step 1c — TheSportsDB enrichment
+            <span className="text-xs px-2 py-0.5 rounded font-normal"
+              style={{ background: 'rgba(45,212,191,0.12)', color: teal, border: '1px solid rgba(45,212,191,0.3)' }}>
+              06:30 UTC
+            </span>
+          </h2>
+          <p className="text-sm mb-1" style={{ color: muted }}>
+            Reads today's matches already in the DB and enriches them with <strong>real draw rates</strong>,
+            goals averages and form from TheSportsDB league standings (<code>lookuptable</code>).
+            Also updates <code>avg_draw_rate</code> on league rows from live data.
+          </p>
+          <p className="text-xs mb-4" style={{ color: muted }}>
+            Free key <code>123</code> — 30 req/min. Returns top 5 table rows per league.
+            Sets <code>has_real_team_stats = true</code> on enriched matches.
+            Uses <code>TSDB_API_KEY</code> env var (falls back to <code>123</code>).
+          </p>
+          <button onClick={runTSDBEnrich} disabled={tsdbStatus === 'loading'}
+            className="px-5 py-2 rounded font-medium text-sm transition-all"
+            style={{
+              background: tsdbStatus === 'loading' ? 'rgba(255,255,255,0.05)' : 'rgba(45,212,191,0.08)',
+              color: tsdbStatus === 'loading' ? muted : teal,
+              border: `1px solid ${tsdbStatus === 'loading' ? border : 'rgba(45,212,191,0.3)'}`,
+              cursor: tsdbStatus === 'loading' ? 'not-allowed' : 'pointer',
+            }}>
+            {tsdbStatus === 'loading' ? 'Enriching…' : tsdbStatus === 'success' ? 'Enriched ✓' : '📊 Run TSDB Enrich'}
+          </button>
+
+          {tsdbResult && tsdbStatus === 'success' && (
+            <div className="mt-3 flex flex-col gap-2">
+              <div className="grid grid-cols-4 gap-2">
+                {[
+                  { label: 'Enriched',  value: tsdbResult.enriched ?? 0 },
+                  { label: 'Leagues',   value: tsdbResult.leaguesProcessed ?? 0 },
+                  { label: 'Teams',     value: tsdbResult.teamsCoveredByTable ?? 0 },
+                  { label: 'API calls', value: tsdbResult.requestsUsed ?? 0 },
+                ].map((s) => (
+                  <div key={s.label} className="rounded-lg p-2 text-center" style={{ background: 'var(--radar-bg)' }}>
+                    <p className="text-base font-bold" style={{ color: teal }}>{s.value}</p>
+                    <p className="text-xs mt-0.5" style={{ color: muted }}>{s.label}</p>
+                  </div>
+                ))}
+              </div>
+              {tsdbResult.budget && (
+                <div className="rounded p-2 flex gap-4 text-xs" style={{ background: 'var(--radar-bg)' }}>
+                  <span style={{ color: muted }}>Rate limit:</span>
+                  <span style={{ color: teal }}>{tsdbResult.budget.used}/30 used this minute</span>
+                  <span style={{ color: muted }}>{tsdbResult.budget.remaining} remaining</span>
+                </div>
+              )}
+              {tsdbResult.leagueDrawRatesUpdated ? (
+                <p className="text-xs" style={{ color: muted }}>
+                  Updated live avg_draw_rate on {tsdbResult.leagueDrawRatesUpdated} league(s)
+                </p>
+              ) : null}
+            </div>
+          )}
+          {tsdbResult?.error && tsdbStatus === 'error' && (
+            <p className="mt-2 text-xs font-mono" style={{ color: '#ef4444' }}>{tsdbResult.error}</p>
+          )}
+        </section>
+
+        {/* Step 2 — Main Pipeline */}
+        <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
+          <h2 className="font-semibold mb-1 flex items-center gap-2">
+            Step 2 — Run enhanced pipeline
+            <span className="text-xs px-2 py-0.5 rounded font-normal"
+              style={{ background: 'rgba(0,255,135,0.1)', color: green, border: '1px solid rgba(0,255,135,0.25)' }}>
+              07:00 UTC
+            </span>
+          </h2>
           <p className="text-sm mb-2" style={{ color: muted }}>
-            Fetches fixtures + odds, team stats, form, H2H, and computes predictions via draw engine v5.
-            Scores ALL matches in DB (including AllSports-sourced ones from Step 1b).
+            Fetches API-Football fixtures + odds, team stats, H2H, form, scores ALL matches in DB
+            (including AllSports rows from 1b, enriched by TSDB from 1c), then saves top-10 predictions.
           </p>
           <ul className="text-xs mb-4 list-disc list-inside" style={{ color: muted }}>
-            <li>Real H2H draw rate (weighted recent-biased)</li>
+            <li>Real H2H draw rate (weighted, recent-biased)</li>
             <li>Form streak — weighted last-5 draw rate + goals avg</li>
             <li>Fatigue proxy — games in last 14 days</li>
-            <li>Line movement — opening odds vs current (stored for tomorrow)</li>
+            <li>Line movement — opening vs current odds</li>
             <li>Platt-scaled confidence (identity until calibrated)</li>
           </ul>
           <div className="flex gap-3 items-center">
@@ -351,8 +479,7 @@ export default function AdminPage() {
               {status === 'loading' ? 'Running pipeline…' : '▶ Run pipeline'}
             </button>
             {status === 'success' && (
-              <a href="/"
-                className="px-4 py-2 rounded font-medium text-sm"
+              <a href="/" className="px-4 py-2 rounded font-medium text-sm"
                 style={{ background: 'rgba(0,255,135,0.08)', color: green, border: '1px solid rgba(0,255,135,0.2)' }}>
                 View predictions →
               </a>
@@ -371,22 +498,20 @@ export default function AdminPage() {
                 {accStatus === 'loading' ? 'Loading…' : '↻ Refresh'}
               </button>
             </h2>
-            <div className="flex gap-2">
-              <button onClick={updateAccuracy} disabled={accStatus === 'loading'}
-                className="text-xs px-3 py-1 rounded font-medium"
-                style={{ background: 'rgba(59,130,246,0.1)', color: '#60a5fa', border: '1px solid rgba(59,130,246,0.3)' }}>
-                Update accuracy
-              </button>
-            </div>
+            <button onClick={updateAccuracy} disabled={accStatus === 'loading'}
+              className="text-xs px-3 py-1 rounded font-medium"
+              style={{ background: 'rgba(59,130,246,0.1)', color: '#60a5fa', border: '1px solid rgba(59,130,246,0.3)' }}>
+              Update accuracy
+            </button>
           </div>
 
           {accuracy ? (
             <div className="flex flex-col gap-4">
               <div className="grid grid-cols-3 gap-3">
                 {[
-                  { label: 'Overall hit rate', value: `${accuracy.hitRate}%`, color: green },
-                  { label: 'High conf (≥70%)', value: accuracy.highConfHitRate ? `${accuracy.highConfHitRate}%` : '—', color: '#f59e0b' },
-                  { label: 'Evaluated / pending', value: `${accuracy.totalEvaluated} / ${accuracy.unevaluated}`, color: 'var(--radar-text)' },
+                  { label: 'Overall hit rate',    value: `${accuracy.hitRate}%`,                                               color: green },
+                  { label: 'High conf (≥70%)',    value: accuracy.highConfHitRate ? `${accuracy.highConfHitRate}%` : '—',      color: '#f59e0b' },
+                  { label: 'Evaluated / pending', value: `${accuracy.totalEvaluated} / ${accuracy.unevaluated}`,              color: 'var(--radar-text)' },
                 ].map((s) => (
                   <div key={s.label} className="rounded-lg p-3 text-center" style={{ background: 'var(--radar-bg)' }}>
                     <p className="text-lg font-bold" style={{ color: s.color }}>{s.value}</p>
@@ -428,7 +553,6 @@ export default function AdminPage() {
                       </div>
                     ))}
                   </div>
-
                   {accuracy.signalImpact.sweetSpotOdds.count > 0 && (
                     <div className="rounded p-2 flex justify-between items-center mt-2"
                       style={{ background: 'rgba(0,255,135,0.05)', border: '1px solid rgba(0,255,135,0.2)' }}>
@@ -437,13 +561,10 @@ export default function AdminPage() {
                       </span>
                       <span className="text-sm font-bold" style={{ color: green }}>
                         {accuracy.signalImpact.sweetSpotOdds.hitRate ?? '—'}%
-                        <span className="text-xs font-normal ml-1" style={{ color: muted }}>
-                          ({accuracy.signalImpact.sweetSpotOdds.count})
-                        </span>
+                        <span className="text-xs font-normal ml-1" style={{ color: muted }}>({accuracy.signalImpact.sweetSpotOdds.count})</span>
                       </span>
                     </div>
                   )}
-
                   {accuracy.signalImpact.midRangeOdds && accuracy.signalImpact.midRangeOdds.count > 0 && (
                     <div className="rounded p-2 flex justify-between items-center mt-1"
                       style={{ background: 'var(--radar-bg)', border: `1px solid ${border}` }}>
@@ -452,37 +573,28 @@ export default function AdminPage() {
                       </span>
                       <span className="text-sm font-bold" style={{ color: '#f59e0b' }}>
                         {accuracy.signalImpact.midRangeOdds.hitRate ?? '—'}%
-                        <span className="text-xs font-normal ml-1" style={{ color: muted }}>
-                          ({accuracy.signalImpact.midRangeOdds.count})
-                        </span>
+                        <span className="text-xs font-normal ml-1" style={{ color: muted }}>({accuracy.signalImpact.midRangeOdds.count})</span>
                       </span>
                     </div>
                   )}
                 </div>
               )}
 
-              {accuracy.reliabilityBuckets && accuracy.reliabilityBuckets.length > 0 && (
+              {accuracy.reliabilityBuckets?.length > 0 && (
                 <div>
-                  <p className="text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: muted }}>
-                    Reliability by score bucket
-                  </p>
+                  <p className="text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: muted }}>Reliability by score bucket</p>
                   <div className="flex flex-col gap-1">
                     {accuracy.reliabilityBuckets.map((b) => {
                       const diff = b.actualHitRate - b.predictedHitRate
-                      const diffColor = Math.abs(diff) < 10 ? green : '#ef4444'
                       return (
                         <div key={b.scoreRange} className="flex items-center gap-2 text-xs">
                           <span style={{ color: muted, width: 40 }}>Score {b.scoreRange}</span>
                           <div className="flex-1 relative h-4 rounded overflow-hidden" style={{ background: 'var(--radar-bg)' }}>
-                            <div className="absolute h-full rounded" style={{
-                              width: `${b.actualHitRate}%`, background: 'rgba(0,255,135,0.25)'
-                            }} />
-                            <div className="absolute h-full border-r border-yellow-400 opacity-60" style={{
-                              width: `${b.predictedHitRate}%`
-                            }} />
+                            <div className="absolute h-full rounded" style={{ width: `${b.actualHitRate}%`, background: 'rgba(0,255,135,0.25)' }} />
+                            <div className="absolute h-full border-r border-yellow-400 opacity-60" style={{ width: `${b.predictedHitRate}%` }} />
                           </div>
                           <span style={{ color: green, width: 36, textAlign: 'right' }}>{b.actualHitRate}%</span>
-                          <span style={{ color: diffColor, width: 44, textAlign: 'right' }}>
+                          <span style={{ color: Math.abs(diff) < 10 ? green : '#ef4444', width: 44, textAlign: 'right' }}>
                             {diff >= 0 ? '+' : ''}{diff.toFixed(1)}
                           </span>
                           <span style={{ color: muted }}>({b.count})</span>
@@ -490,23 +602,21 @@ export default function AdminPage() {
                       )
                     })}
                     <p className="text-xs mt-1" style={{ color: muted }}>
-                      Green bar = actual hit rate · Yellow line = predicted · Diff = actual − predicted
+                      Green bar = actual · Yellow line = predicted · Diff = actual − predicted
                     </p>
                   </div>
                 </div>
               )}
 
-              {accuracy.perLeague && accuracy.perLeague.length > 0 && (
+              {accuracy.perLeague?.length > 0 && (
                 <div>
-                  <button onClick={() => setShowLeague((v) => !v)}
-                    className="text-xs" style={{ color: muted }}>
+                  <button onClick={() => setShowLeague((v) => !v)} className="text-xs" style={{ color: muted }}>
                     {showLeague ? '▼' : '▶'} Per-league breakdown ({accuracy.perLeague.length} leagues)
                   </button>
                   {showLeague && (
                     <div className="mt-2 flex flex-col gap-1 max-h-56 overflow-y-auto">
                       {accuracy.perLeague.map((l) => (
-                        <div key={l.league} className="flex justify-between text-xs px-2 py-1 rounded"
-                          style={{ background: 'var(--radar-bg)' }}>
+                        <div key={l.league} className="flex justify-between text-xs px-2 py-1 rounded" style={{ background: 'var(--radar-bg)' }}>
                           <span style={{ color: muted }}>{l.league}</span>
                           <span style={{ color: l.hitRate > 35 ? green : l.hitRate > 25 ? '#f59e0b' : '#ef4444' }}>
                             {l.hitRate}% ({l.count})
@@ -527,8 +637,7 @@ export default function AdminPage() {
         <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
           <h2 className="font-semibold mb-1">Step 4 — Calibrate confidence (monthly)</h2>
           <p className="text-sm mb-4" style={{ color: muted }}>
-            Fits Platt scaling from <code>was_correct</code> data so that confidence % matches actual hit rates.
-            Run once you have ≥20 evaluated predictions. Repeat monthly.
+            Fits Platt scaling from <code>was_correct</code> data. Run once you have ≥20 evaluated predictions. Repeat monthly.
           </p>
           <button onClick={calibrateModel} disabled={calStatus === 'loading'}
             className="px-5 py-2 rounded font-medium text-sm transition-all"
@@ -540,7 +649,6 @@ export default function AdminPage() {
             }}>
             {calStatus === 'loading' ? 'Calibrating…' : calStatus === 'success' ? 'Calibrated ✓' : '⚙ Fit Platt scaling'}
           </button>
-
           {calResult?.success && (
             <div className="mt-3 rounded-lg p-3 text-xs" style={{ background: 'var(--radar-bg)' }}>
               <p style={{ color: green }}>a={calResult.plattA} · b={calResult.plattB}</p>
@@ -549,7 +657,6 @@ export default function AdminPage() {
               </p>
             </div>
           )}
-
           {calResult && !calResult.success && (
             <p className="mt-2 text-xs" style={{ color: muted }}>{calResult.message}</p>
           )}
@@ -557,12 +664,11 @@ export default function AdminPage() {
 
         {/* Pipeline result */}
         {result && status === 'success' && (
-          <section className="rounded-xl p-5"
-            style={{ background: 'rgba(0,255,135,0.05)', border: '1px solid rgba(0,255,135,0.2)' }}>
+          <section className="rounded-xl p-5" style={{ background: 'rgba(0,255,135,0.05)', border: '1px solid rgba(0,255,135,0.2)' }}>
             <p className="text-sm font-semibold mb-3" style={{ color: green }}>Pipeline complete</p>
             <div className="grid grid-cols-2 gap-3">
               {[
-                { label: 'Matches fetched', value: result.fetched ?? 0 },
+                { label: 'Matches fetched',   value: result.fetched ?? 0 },
                 { label: 'Predictions saved', value: result.predictions ?? 0 },
               ].map((s) => (
                 <div key={s.label} className="rounded-lg p-3 text-center" style={{ background: 'var(--radar-bg)' }}>
@@ -579,10 +685,8 @@ export default function AdminPage() {
           </section>
         )}
 
-        {/* Pipeline error */}
         {result && status === 'error' && (
-          <section className="rounded-xl p-5"
-            style={{ background: 'rgba(239,68,68,0.05)', border: '1px solid rgba(239,68,68,0.2)' }}>
+          <section className="rounded-xl p-5" style={{ background: 'rgba(239,68,68,0.05)', border: '1px solid rgba(239,68,68,0.2)' }}>
             <p className="text-sm font-semibold mb-2" style={{ color: '#ef4444' }}>Pipeline error</p>
             <p className="text-xs font-mono" style={{ color: muted }}>{result.error}</p>
           </section>

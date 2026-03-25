@@ -9,6 +9,7 @@ export const ODDS_API_BASE = 'https://api.the-odds-api.com/v4'
 // Leagues supported on free tier that match your LEAGUE_FLAGS map.
 // sport_key list: https://the-odds-api.com/sports-odds-data/sports-apis.html
 export const SUPPORTED_SPORT_KEYS: Record<string, { name: string; country: string }> = {
+  // Soccer
   'soccer_epl':              { name: 'Premier League',  country: 'England' },
   'soccer_germany_bundesliga':{ name: 'Bundesliga',     country: 'Germany' },
   'soccer_spain_la_liga':    { name: 'La Liga',         country: 'Spain'   },
@@ -17,6 +18,9 @@ export const SUPPORTED_SPORT_KEYS: Record<string, { name: string; country: strin
   'soccer_netherlands_eredivisie': { name: 'Eredivisie', country: 'Netherlands' },
   'soccer_portugal_primeira_liga': { name: 'Primeira Liga', country: 'Portugal' },
   'soccer_turkey_super_league':    { name: 'Super Lig',  country: 'Turkey'  },
+  // Basketball
+  'basketball_nba':          { name: 'NBA',             country: 'USA'     },
+  'basketball_wnba':         { name: 'WNBA',            country: 'USA'     },
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -39,32 +43,34 @@ export interface OddsApiBookmaker {
 }
 
 export interface OddsApiMarket {
-  key: string   // 'h2h'
+  key: string   // 'h2h' | 'totals' | 'spreads'
   last_update: string
   outcomes: OddsApiOutcome[]
 }
 
 export interface OddsApiOutcome {
-  name: string   // home team name | away team name | 'Draw'
+  name: string   // home team name | away team name | 'Draw' | 'Over' | 'Under'
   price: number  // decimal odds
+  point?: number // for totals (Over/Under) and spreads
 }
 
 // ─── Fetch helpers ────────────────────────────────────────────────────────────
 
 /**
- * Fetch all upcoming events + h2h odds for a single sport key.
+ * Fetch all upcoming events + odds for a single sport key.
  * Uses 1 API request per sport key.
  * Pass dateFrom / dateTo (ISO strings) to restrict to today only.
+ * Pass markets to specify which betting markets (default: h2h for soccer).
  */
 export async function fetchOddsForSport(
   sportKey: string,
   apiKey: string,
-  options: { dateFrom?: string; dateTo?: string } = {}
+  options: { dateFrom?: string; dateTo?: string; markets?: string } = {}
 ): Promise<OddsApiEvent[]> {
   const params = new URLSearchParams({
     apiKey,
     regions: 'eu',          // European bookmakers → better draw odds
-    markets: 'h2h',
+    markets: options.markets ?? 'h2h',
     oddsFormat: 'decimal',
     dateFormat: 'iso',
   })
