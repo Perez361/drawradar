@@ -28,6 +28,7 @@ import {
   fetchRecentFixtures,
   type H2HResult,
 } from './api-football'
+import { FORM_WEIGHTS } from './drawEngine'
 
 const TEAM_STATS_TTL_DAYS  = 7
 const FORM_CACHE_TTL_HOURS = 24
@@ -225,10 +226,9 @@ export async function getFormStatsBatch(
       continue
     }
 
-    const weights = [1.0, 0.9, 0.8, 0.7, 0.6]
     let wDraws = 0, wGoals = 0, totalW = 0
     recentFixtures.slice(0, 5).forEach((f, i) => {
-      const w = weights[i]
+      const w = FORM_WEIGHTS[i]
       wDraws += w * (f.isDraw ? 1 : 0)
       wGoals += w * f.goalsScored
       totalW += w

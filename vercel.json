@@ -1,6 +1,10 @@
 {
   "crons": [
     {
+      "path": "/api/admin/allsports-fixtures",
+      "schedule": "0 6 * * *"
+    },
+    {
       "path": "/api/trigger-predictions",
       "schedule": "0 7 * * *"
     }

@@ -46,7 +46,6 @@ interface AccuracyData {
     withForm: SignalImpact
     withoutForm: SignalImpact
     sweetSpotOdds: SignalImpact & { range: string }
-    // New in v3
     fatigueHigh?: SignalImpact
     midRangeOdds?: SignalImpact & { range: string }
     realTeamStats?: SignalImpact
@@ -64,6 +63,18 @@ interface AccuracyData {
   }>
 }
 
+interface AllSportsResult {
+  success?: boolean
+  date?: string
+  fetched?: number
+  tracked?: number
+  upserted?: number
+  skippedNoOdds?: number
+  skippedOddsRange?: number
+  message?: string
+  error?: string
+}
+
 export default function AdminPage() {
   const [status, setStatus]           = useState<Status>('idle')
   const [result, setResult]           = useState<PipelineResult | null>(null)
@@ -74,6 +85,8 @@ export default function AdminPage() {
   const [calStatus, setCalStatus]     = useState<Status>('idle')
   const [calResult, setCalResult]     = useState<any>(null)
   const [showLeague, setShowLeague]   = useState(false)
+  const [asStatus, setAsStatus]       = useState<Status>('idle')
+  const [asResult, setAsResult]       = useState<AllSportsResult | null>(null)
 
   function addLog(msg: string, type: LogLine['type'] = 'info') {
     const ts = new Date().toLocaleTimeString('en-GB')
@@ -118,6 +131,31 @@ export default function AdminPage() {
     } catch (err) {
       addLog(`Network error: ${err instanceof Error ? err.message : String(err)}`, 'error')
       setClearStatus('error')
+    }
+  }
+
+  async function fetchAllSports() {
+    setAsStatus('loading')
+    setAsResult(null)
+    addLog('Fetching AllSportsAPI fixtures + odds …')
+    try {
+      const res  = await fetch('/api/admin/allsports-fixtures')
+      const data = await res.json() as AllSportsResult
+      setAsResult(data)
+      if (data.error) {
+        addLog(`AllSports error: ${data.error}`, 'error')
+        setAsStatus('error')
+      } else {
+        addLog(
+          `AllSports done — fetched: ${data.fetched ?? 0}, tracked: ${data.tracked ?? 0}, ` +
+          `upserted: ${data.upserted ?? 0}, no-odds: ${data.skippedNoOdds ?? 0}`,
+          'success'
+        )
+        setAsStatus('success')
+      }
+    } catch (err) {
+      addLog(`AllSports network error: ${err instanceof Error ? err.message : String(err)}`, 'error')
+      setAsStatus('error')
     }
   }
 
@@ -180,8 +218,8 @@ export default function AdminPage() {
   const border   = 'var(--radar-border)'
   const muted    = 'var(--radar-muted)'
   const green    = 'var(--radar-green)'
+  const orange   = '#fb923c'
 
-  // Build signal rows dynamically so new fields auto-render
   const buildSignalRows = (si: AccuracyData['signalImpact']) => {
     const rows: Array<{ label: string; count: number; hitRate: number | null; range?: string }> = [
       { label: 'Real H2H data', ...si.realH2H },
@@ -232,11 +270,67 @@ export default function AdminPage() {
           </button>
         </section>
 
+        {/* Step 1b — AllSportsAPI */}
+        <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
+          <h2 className="font-semibold mb-1 flex items-center gap-2">
+            Step 1b — Fetch AllSportsAPI fixtures
+            <span className="text-xs px-2 py-0.5 rounded font-normal"
+              style={{ background: 'rgba(251,146,60,0.12)', color: orange, border: '1px solid rgba(251,146,60,0.3)' }}>
+              SUPPLEMENTARY
+            </span>
+          </h2>
+          <p className="text-sm mb-1" style={{ color: muted }}>
+            Supplements today's match pool with fixtures + draw odds from AllSportsAPI
+            (<code>apiv2.allsportsapi.com</code>). Runs at <strong>06:00 UTC</strong> automatically,
+            1 hour before the main pipeline.
+          </p>
+          <p className="text-xs mb-4" style={{ color: muted }}>
+            Uses <code>ALLSPORTS_API_KEY</code> env var. Stores matches as{' '}
+            <code>external_id = "allsp_&lt;match_id&gt;"</code> to avoid collisions with API-Football rows.
+            Stats use league baselines (no team-level data from AllSports).
+          </p>
+          <div className="flex gap-3 items-center flex-wrap">
+            <button onClick={fetchAllSports} disabled={asStatus === 'loading'}
+              className="px-5 py-2 rounded font-medium text-sm transition-all"
+              style={{
+                background: asStatus === 'loading' ? 'rgba(255,255,255,0.05)' : 'rgba(251,146,60,0.1)',
+                color: asStatus === 'loading' ? muted : orange,
+                border: `1px solid ${asStatus === 'loading' ? border : 'rgba(251,146,60,0.35)'}`,
+                cursor: asStatus === 'loading' ? 'not-allowed' : 'pointer',
+              }}>
+              {asStatus === 'loading' ? 'Fetching…' : asStatus === 'success' ? 'Fetched ✓' : '⚡ Fetch AllSports'}
+            </button>
+          </div>
+
+          {asResult && asStatus === 'success' && (
+            <div className="mt-3 grid grid-cols-4 gap-2">
+              {[
+                { label: 'API total',   value: asResult.fetched ?? 0 },
+                { label: 'Tracked',     value: asResult.tracked ?? 0 },
+                { label: 'Upserted',    value: asResult.upserted ?? 0 },
+                { label: 'No odds',     value: asResult.skippedNoOdds ?? 0 },
+              ].map((s) => (
+                <div key={s.label} className="rounded-lg p-2 text-center" style={{ background: 'var(--radar-bg)' }}>
+                  <p className="text-base font-bold" style={{ color: orange }}>{s.value}</p>
+                  <p className="text-xs mt-0.5" style={{ color: muted }}>{s.label}</p>
+                </div>
+              ))}
+            </div>
+          )}
+          {asResult?.message && asStatus === 'success' && (
+            <p className="mt-2 text-xs" style={{ color: muted }}>{asResult.message}</p>
+          )}
+          {asResult?.error && asStatus === 'error' && (
+            <p className="mt-2 text-xs font-mono" style={{ color: '#ef4444' }}>{asResult.error}</p>
+          )}
+        </section>
+
         {/* Step 2 — Pipeline */}
         <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
           <h2 className="font-semibold mb-1">Step 2 — Run enhanced pipeline</h2>
           <p className="text-sm mb-2" style={{ color: muted }}>
             Fetches fixtures + odds, team stats, form, H2H, and computes predictions via draw engine v5.
+            Scores ALL matches in DB (including AllSports-sourced ones from Step 1b).
           </p>
           <ul className="text-xs mb-4 list-disc list-inside" style={{ color: muted }}>
             <li>Real H2H draw rate (weighted recent-biased)</li>
@@ -288,7 +382,6 @@ export default function AdminPage() {
 
           {accuracy ? (
             <div className="flex flex-col gap-4">
-              {/* Core stats */}
               <div className="grid grid-cols-3 gap-3">
                 {[
                   { label: 'Overall hit rate', value: `${accuracy.hitRate}%`, color: green },
@@ -302,7 +395,6 @@ export default function AdminPage() {
                 ))}
               </div>
 
-              {/* Calibration status */}
               {accuracy.calibration && (
                 <div className="rounded-lg p-3" style={{ background: 'var(--radar-bg)' }}>
                   <p className="text-xs font-semibold mb-1" style={{ color: muted }}>Platt calibration</p>
@@ -321,7 +413,6 @@ export default function AdminPage() {
                 </div>
               )}
 
-              {/* Signal impact */}
               {accuracy.signalImpact && (
                 <div>
                   <p className="text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: muted }}>Signal impact</p>
@@ -338,7 +429,6 @@ export default function AdminPage() {
                     ))}
                   </div>
 
-                  {/* Sweet spot odds */}
                   {accuracy.signalImpact.sweetSpotOdds.count > 0 && (
                     <div className="rounded p-2 flex justify-between items-center mt-2"
                       style={{ background: 'rgba(0,255,135,0.05)', border: '1px solid rgba(0,255,135,0.2)' }}>
@@ -354,7 +444,6 @@ export default function AdminPage() {
                     </div>
                   )}
 
-                  {/* Mid-range odds */}
                   {accuracy.signalImpact.midRangeOdds && accuracy.signalImpact.midRangeOdds.count > 0 && (
                     <div className="rounded p-2 flex justify-between items-center mt-1"
                       style={{ background: 'var(--radar-bg)', border: `1px solid ${border}` }}>
@@ -372,7 +461,6 @@ export default function AdminPage() {
                 </div>
               )}
 
-              {/* Reliability buckets */}
               {accuracy.reliabilityBuckets && accuracy.reliabilityBuckets.length > 0 && (
                 <div>
                   <p className="text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: muted }}>
@@ -408,7 +496,6 @@ export default function AdminPage() {
                 </div>
               )}
 
-              {/* Per-league toggle */}
               {accuracy.perLeague && accuracy.perLeague.length > 0 && (
                 <div>
                   <button onClick={() => setShowLeague((v) => !v)}

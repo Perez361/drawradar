@@ -22,6 +22,16 @@
 //   9. poissonDrawProbability maxGoals cap raised: uses dynamic ceiling based
 //      on actual lambda rather than a fixed heuristic, reducing undercount on
 //      high-scoring matches.
+//  10. Input validation added: xG and odds are now sanitized to prevent edge cases.
+
+// ─── Shared constants ─────────────────────────────────────────────────────────
+
+// Form weights: most recent game = 1.0, decreasing for older games
+export const FORM_WEIGHTS = [1.0, 0.9, 0.8, 0.7, 0.6]
+
+// H2H weights: recent 5 matches get 2x weight, older 5 get 1x
+const H2H_RECENT_WEIGHT = 2
+const H2H_OLD_WEIGHT = 1
 
 // ─── Poisson helpers ──────────────────────────────────────────────────────────
 
@@ -295,8 +305,13 @@ function computeLeagueScore(
 // ─── Core prediction ──────────────────────────────────────────────────────────
 
 export function predictDraw(f: DrawFeatures): DrawPrediction {
-  const poissonProb = poissonDrawProbability(f.xgHome, f.xgAway)
-  const impliedProb = 1 / f.drawOdds
+  // Validate and sanitize inputs
+  const xgHome = Math.max(0.1, Math.min(5, f.xgHome ?? 1.2))
+  const xgAway = Math.max(0.1, Math.min(5, f.xgAway ?? 1.2))
+  const drawOdds = Math.max(1.5, Math.min(15, f.drawOdds ?? 3.2))
+  
+  const poissonProb = poissonDrawProbability(xgHome, xgAway)
+  const impliedProb = 1 / drawOdds
 
   // ── Component scores ──────────────────────────────────────────────────────
   const poissonScore      = computePoissonScore(poissonProb)
@@ -305,7 +320,7 @@ export function predictDraw(f: DrawFeatures): DrawPrediction {
   const h2hScore          = computeH2HScore(f)
   const teamDrawScore     = computeTeamDrawScore(f)
   const formScore         = computeFormScore(f)
-  const oddsScore         = computeOddsScore(f.drawOdds)
+  const oddsScore         = computeOddsScore(drawOdds)
   const lineMovementScore = computeLineMovementScore(f.oddsMovement)
   const fatigueScore      = computeFatigueScore(f.homeGamesLast14, f.awayGamesLast14)
   const leagueScore       = computeLeagueScore(f.leagueAvgDrawRate, f.leagueDrawBoost)
@@ -426,11 +441,10 @@ export function computeFormMetrics(
 ): { formDrawRate: number; formGoalsAvg: number } {
   if (recentGames.length === 0) return { formDrawRate: 0.27, formGoalsAvg: 1.4 }
 
-  const weights = [1.0, 0.9, 0.8, 0.7, 0.6]
   let weightedDraws = 0, weightedGoals = 0, totalWeight = 0
 
   recentGames.slice(0, 5).forEach((g, i) => {
-    const w = weights[i]
+    const w = FORM_WEIGHTS[i]
     weightedDraws += w * (g.isDraw ? 1 : 0)
     weightedGoals += w * g.goalsScored
     totalWeight += w

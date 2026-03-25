@@ -1,6 +1,7 @@
 export const revalidate = 0
+export const dynamic = 'force-dynamic'
 
-import { supabase, impliedProbability } from '@/lib/supabase'
+import { supabaseAdmin, impliedProbability } from '@/lib/supabase'
 import type { Prediction } from '@/lib/supabase'
 import Link from 'next/link'
 
@@ -130,7 +131,8 @@ export default async function HomePage() {
     timeZone: 'UTC',
   })
 
-  const { data: predictions, error } = await supabase
+  // Use supabaseAdmin to bypass RLS — same as /api/predictions
+  const { data: predictions, error } = await supabaseAdmin
     .from('predictions')
     .select(`*, matches(*, leagues(name, country, avg_draw_rate, draw_boost))`)
     .eq('prediction_date', today)
@@ -192,7 +194,7 @@ export default async function HomePage() {
       <main className="max-w-5xl mx-auto px-4 py-10">
         <div className="mb-10">
           <p className="text-sm mb-1" style={{ color: 'var(--radar-muted)' }}>{formattedDate}</p>
-          <h2 className="text-3xl font-bold mb-2 tracking-tight">Today's Top Draw Predictions</h2>
+          <h2 className="text-3xl font-bold mb-2 tracking-tight">Today&apos;s Top Draw Predictions</h2>
           <p className="text-sm mb-8" style={{ color: 'var(--radar-muted)' }}>
             Powered by Poisson model · 10-point scoring system · Updated daily at 07:00 UTC
           </p>

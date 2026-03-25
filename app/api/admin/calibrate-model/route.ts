@@ -65,7 +65,7 @@ export async function POST() {
       const hitRate  = inBucket.filter((p) => p.was_correct).length / inBucket.length
 
       // Map avg score to sigmoid-predicted probability
-      const sigmoid = 1 / (1 + Math.exp(-(avgScore - 5) * 0.55))
+      const sigmoid = 1 / (1 + Math.exp(-(avgScore - 5) * 0.60))
       const predictedRate = 0.15 + sigmoid * 0.70  // same as confidence formula
 
       buckets.push({
