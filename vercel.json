@@ -5,6 +5,10 @@
       "schedule": "0 6 * * *"
     },
     {
+      "path": "/api/admin/tsdb-enrich",
+      "schedule": "30 6 * * *"
+    },
+    {
       "path": "/api/trigger-predictions",
       "schedule": "0 7 * * *"
     }
