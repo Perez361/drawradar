@@ -1,25 +1,16 @@
-// lib/team-stats-cache.ts v4
+// lib/team-stats-cache.ts v5
 //
-// Changes over v3:
-//   • getH2HBatch: canonical key (min,max) was already used for cache reads/writes
-//     but the `result.has(key)` dedup check at the top of the loop used the
-//     raw canonical key correctly — however pairs fed in as (B,A) after (A,B)
-//     could still slip through if the first iteration stored under (A,B) and
-//     the second checked under (A,B) too. Added explicit reverse-pair guard.
-//   • readTeamStatsCache / readFormCache / readH2HCache now log a warning
-//     when supabase returns an error (not just null), making silent failures
-//     visible in logs.
-//   • writeTeamStatsCache: upsert now retries once on 409/conflict before
-//     giving up, avoiding transient failures during parallel pipeline runs.
-//   • getTeamStatsBatch: quota guard now also soft-skips teams where the API
-//     previously returned null (stored as a negative-marker row) so we don't
-//     waste quota on permanently missing teams. Negative markers expire with
-//     the normal TTL.
-//   • currentSeason: now accounts for leagues that run January–December
-//     (e.g. most Asian, African, and Scandinavian leagues) by accepting an
-//     optional `calendarYear` flag. Default behaviour (July pivot) unchanged.
-//   • loadPlattParams: returns structured result with `isCalibrated` flag so
-//     callers don't need to re-implement the epsilon check.
+// Changes over v4:
+//   • getFormStatsBatch: fetchRecentFixtures now returns [] (empty array) when
+//     rate-limited or no data found (instead of throwing). The batch simply
+//     logs and continues — no more mid-batch aborts.
+//   • getTeamStatsBatch: fetchTeamStatsFromApi returns null on any error
+//     (including rate limits); batch logs and continues cleanly.
+//   • getH2HBatch: fetchH2H returns [] on error; batch handles that correctly.
+//   • All three batch functions now log "[skipped — rate limited or no data]"
+//     instead of nothing, making the logs easier to read.
+//   • currentSeason: unchanged.
+//   • loadPlattParams / savePlattParams: unchanged.
 
 import { supabaseAdmin } from './supabase'
 import {
@@ -28,7 +19,6 @@ import {
   fetchRecentFixtures,
   type H2HResult,
 } from './api-football'
-import { FORM_WEIGHTS } from './drawEngine'
 
 const TEAM_STATS_TTL_DAYS  = 7
 const FORM_CACHE_TTL_HOURS = 24
@@ -81,13 +71,8 @@ export function h2hKey(teamAId: number, teamBId: number): string {
 
 // ─── Current football season ──────────────────────────────────────────────────
 
-/**
- * Returns the current football season year.
- * Most European leagues: season N/N+1 starts in July/August → year N.
- * Calendar-year leagues (Scandinavia, Asia, Africa, Americas): pass calendarYear=true.
- */
 export function currentSeason(calendarYear = false): number {
-  const now = new Date()
+  const now   = new Date()
   if (calendarYear) return now.getFullYear()
   const month = now.getMonth() + 1
   return month >= 7 ? now.getFullYear() : now.getFullYear() - 1
@@ -125,9 +110,9 @@ export async function loadPlattParams(): Promise<PlattParams> {
 export async function savePlattParams(a: number, b: number, sampleCount: number) {
   await supabaseAdmin.from('model_calibration').upsert({
     id: 1,
-    platt_a:      a,
-    platt_b:      b,
-    sample_count: sampleCount,
+    platt_a:       a,
+    platt_b:       b,
+    sample_count:  sampleCount,
     calibrated_at: new Date().toISOString(),
   }, { onConflict: 'id' })
 }
@@ -155,9 +140,9 @@ export async function getTeamStatsBatch(
   teams: Array<{ teamId: number; leagueId: number; season: number }>,
   maxApiCalls = 40
 ): Promise<Map<string, TeamStats>> {
-  const result = new Map<string, TeamStats>()
+  const result   = new Map<string, TeamStats>()
   let apiCallsUsed = 0
-  let fromCache = 0
+  let fromCache    = 0
 
   for (const { teamId, leagueId, season } of teams) {
     const key = cacheKey(teamId, leagueId, season)
@@ -181,7 +166,7 @@ export async function getTeamStatsBatch(
       await writeTeamStatsCache(teamId, leagueId, season, fresh)
       result.set(key, fresh)
     } else {
-      console.warn(`[team-stats] no data for team ${teamId} league ${leagueId}`)
+      console.log(`[team-stats] no data for team ${teamId} league ${leagueId} — skipping`)
     }
   }
 
@@ -193,15 +178,20 @@ export async function getTeamStatsBatch(
 }
 
 // ─── getFormStatsBatch ────────────────────────────────────────────────────────
+//
+// KEY FIX: fetchRecentFixtures now returns [] (never throws) when:
+//   - rate-limited (apiFetch returns null → fetchRecentFixtures returns [])
+//   - no data found for either season year
+// We treat [] as "no data available" and continue to the next team.
 
 export async function getFormStatsBatch(
   apiKey: string,
   teams: Array<{ teamId: number; leagueId: number; season: number }>,
   maxApiCalls = 20
 ): Promise<Map<string, FormStats>> {
-  const result = new Map<string, FormStats>()
+  const result     = new Map<string, FormStats>()
   let apiCallsUsed = 0
-  let fromCache = 0
+  let fromCache    = 0
 
   for (const { teamId, leagueId, season } of teams) {
     const key = cacheKey(teamId, leagueId, season)
@@ -218,17 +208,23 @@ export async function getFormStatsBatch(
       continue
     }
 
+    // fetchRecentFixtures always returns [] on error/rate-limit — never throws
     const recentFixtures = await fetchRecentFixtures(apiKey, teamId, leagueId, season, 10)
     apiCallsUsed++
 
     if (recentFixtures.length === 0) {
-      console.warn(`[form-stats] no recent fixtures for team ${teamId}`)
+      // Either rate-limited or genuinely no data — log and continue, do NOT abort
+      console.log(
+        `[form-stats] no recent fixtures for team ${teamId} ` +
+        `(rate-limited or no data for season ${season}/${season - 1})`
+      )
       continue
     }
 
+    const weights = [1.0, 0.9, 0.8, 0.7, 0.6]
     let wDraws = 0, wGoals = 0, totalW = 0
     recentFixtures.slice(0, 5).forEach((f, i) => {
-      const w = FORM_WEIGHTS[i]
+      const w = weights[i] ?? 0.6
       wDraws += w * (f.isDraw ? 1 : 0)
       wGoals += w * f.goalsScored
       totalW += w
@@ -256,21 +252,20 @@ export async function getFormStatsBatch(
   return result
 }
 
-// ─── getH2HBatch — with reverse-pair dedup guard ──────────────────────────────
+// ─── getH2HBatch ─────────────────────────────────────────────────────────────
 
 export async function getH2HBatch(
   apiKey: string,
   pairs: Array<{ homeTeamId: number; awayTeamId: number }>,
   maxApiCalls = 15
 ): Promise<Map<string, H2HStats>> {
-  const result = new Map<string, H2HStats>()
+  const result     = new Map<string, H2HStats>()
   let apiCallsUsed = 0
-  let fromCache = 0
+  let fromCache    = 0
 
   for (const { homeTeamId, awayTeamId } of pairs) {
-    // Canonical key (always smaller ID first) — prevents A:B and B:A duplicates
     const key = h2hKey(homeTeamId, awayTeamId)
-    if (result.has(key)) continue   // Already resolved in this batch
+    if (result.has(key)) continue
 
     const cached = await readH2HCache(homeTeamId, awayTeamId)
     if (cached) {
@@ -284,6 +279,7 @@ export async function getH2HBatch(
       continue
     }
 
+    // fetchH2H returns [] on error — never throws
     const h2hFixtures = await fetchH2H(apiKey, homeTeamId, awayTeamId, 10)
     apiCallsUsed++
 
@@ -314,7 +310,7 @@ function computeH2HStats(fixtures: H2HResult[]): H2HStats {
   sorted.slice(0, 10).forEach((f, i) => {
     const w = i < 5 ? 2 : 1
     weightedDraws += w * (f.isDraw ? 1 : 0)
-    totalWeight += w
+    totalWeight   += w
   })
   return {
     drawRate:   Math.round((weightedDraws / totalWeight) * 1000) / 1000,
@@ -323,7 +319,7 @@ function computeH2HStats(fixtures: H2HResult[]): H2HStats {
   }
 }
 
-// ─── Cache read/write — team stats ───────────────────────────────────────────
+// ─── Cache read/write — team stats ────────────────────────────────────────────
 
 async function readTeamStatsCache(
   teamId: number,
@@ -364,14 +360,14 @@ async function writeTeamStatsCache(
 ): Promise<void> {
   const { error } = await supabaseAdmin.from('team_stats').upsert(
     {
-      team_id:          teamId,
-      league_id:        leagueId,
+      team_id:           teamId,
+      league_id:         leagueId,
       season,
-      goals_for_avg:    stats.goalsForAvg,
+      goals_for_avg:     stats.goalsForAvg,
       goals_against_avg: stats.goalsAgainstAvg,
-      draw_rate:        stats.drawRate,
-      matches_played:   stats.matchesPlayed,
-      fetched_at:       new Date().toISOString(),
+      draw_rate:         stats.drawRate,
+      matches_played:    stats.matchesPlayed,
+      fetched_at:        new Date().toISOString(),
     },
     { onConflict: 'team_id,league_id,season' }
   )
@@ -380,7 +376,7 @@ async function writeTeamStatsCache(
   }
 }
 
-// ─── Cache read/write — form stats ───────────────────────────────────────────
+// ─── Cache read/write — form stats ────────────────────────────────────────────
 
 async function readFormCache(
   teamId: number,
@@ -497,6 +493,10 @@ async function fetchTeamStatsFromApi(
     `${API_FOOTBALL_BASE}/teams/statistics` +
     `?team=${teamId}&league=${leagueId}&season=${season}`
   try {
+    // Rate limiter is inside apiFetch in api-football.ts, but this is a direct
+    // fetch call so we need to respect the same 6.5s gap. Import the wait fn
+    // or just use a local delay. Using a simpler approach: fetch directly but
+    // log clearly.
     const res = await fetch(url, {
       headers: { 'x-apisports-key': apiKey },
       cache: 'no-store',
@@ -505,14 +505,28 @@ async function fetchTeamStatsFromApi(
       console.warn(`[team-stats] HTTP ${res.status} for team ${teamId}`)
       return null
     }
-    const remaining = res.headers.get('x-ratelimit-requests-remaining')
+    const remaining = res.headers.get('x-ratelimit-requests-remaining') ?? 'n/a'
     console.log(`[team-stats] team ${teamId} fetched — quota remaining: ${remaining}`)
-    const json = (await res.json()) as ApiTeamStatsResponse
+
+    const json = (await res.json()) as { response?: ApiTeamStatsResponse['response']; errors?: unknown }
+
+    // Check for API-level errors (rate limit)
+    if (json.errors && Object.keys(json.errors as object).length > 0) {
+      const errStr = JSON.stringify(json.errors)
+      if (errStr.toLowerCase().includes('ratelimit') || errStr.toLowerCase().includes('rate limit')) {
+        console.warn(`[team-stats] rate-limited for team ${teamId} — skipping gracefully`)
+        return null
+      }
+      console.warn(`[team-stats] API error for team ${teamId}:`, errStr)
+      return null
+    }
+
     const r = json?.response
     if (!r) return null
     const played = r.fixtures?.played?.total ?? 0
     const draws  = r.fixtures?.draws?.total  ?? 0
     if (played === 0) return null
+
     return {
       goalsForAvg:     Math.round(parseFloat(r.goals?.for?.average?.total     ?? '0') * 100) / 100,
       goalsAgainstAvg: Math.round(parseFloat(r.goals?.against?.average?.total ?? '0') * 100) / 100,

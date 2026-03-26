@@ -1,7 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 
+// ── Existing types (kept exactly as-is) ──────────────────────────────────────
 type Status = 'idle' | 'loading' | 'success' | 'error'
 
 interface PipelineResult {
@@ -90,6 +91,45 @@ interface TSDBResult {
   error?: string
 }
 
+// ── New scraper types ─────────────────────────────────────────────────────────
+
+interface ScraperRun {
+  id: number
+  source: string
+  run_type: string
+  status: 'running' | 'done' | 'error'
+  records_upserted: number
+  error_message: string | null
+  started_at: string
+  finished_at: string | null
+}
+
+interface ScraperStatus {
+  scraperRuns: ScraperRun[]
+  stats: {
+    rawXgTotal: number
+    rawXgLinked: number
+    oddsSnapshots: number
+    matchesWithXg: number
+  }
+}
+
+interface XgResult {
+  success?: boolean
+  results?: { understat?: number; fbref?: number }
+  totalRecords?: number
+  errors?: number
+  error?: string
+}
+
+interface OddsSnapshotResult {
+  success?: boolean
+  snapshots?: number
+  error?: string
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export default function AdminPage() {
   const [status, setStatus]           = useState<Status>('idle')
   const [result, setResult]           = useState<PipelineResult | null>(null)
@@ -105,9 +145,27 @@ export default function AdminPage() {
   const [tsdbStatus, setTsdbStatus]   = useState<Status>('idle')
   const [tsdbResult, setTsdbResult]   = useState<TSDBResult | null>(null)
 
+  // New scraper state
+  const [scraperStatus, setScraperStatus]     = useState<ScraperStatus | null>(null)
+  const [xgStatus, setXgStatus]               = useState<Status>('idle')
+  const [xgResult, setXgResult]               = useState<XgResult | null>(null)
+  const [oddsSnapStatus, setOddsSnapStatus]   = useState<Status>('idle')
+  const [oddsSnapResult, setOddsSnapResult]   = useState<OddsSnapshotResult | null>(null)
+
   function addLog(msg: string, type: LogLine['type'] = 'info') {
     const ts = new Date().toLocaleTimeString('en-GB')
     setLogs((prev) => [...prev, { ts, msg, type }])
+  }
+
+  // Load scraper status on mount
+  useEffect(() => { loadScraperStatus() }, [])
+
+  async function loadScraperStatus() {
+    try {
+      const res = await fetch('/api/admin/scraper-status')
+      const data = await res.json()
+      if (!data.error) setScraperStatus(data)
+    } catch { /* silent */ }
   }
 
   async function runPipeline() {
@@ -179,7 +237,7 @@ export default function AdminPage() {
   async function runTSDBEnrich() {
     setTsdbStatus('loading')
     setTsdbResult(null)
-    addLog('Running TheSportsDB enrichment (standings → real draw rates) …')
+    addLog('Running TheSportsDB enrichment …')
     try {
       const res  = await fetch('/api/admin/tsdb-enrich')
       const data = await res.json() as TSDBResult
@@ -188,12 +246,7 @@ export default function AdminPage() {
         addLog(`TSDB error: ${data.error}`, 'error')
         setTsdbStatus('error')
       } else {
-        addLog(
-          `TSDB done — enriched: ${data.enriched ?? 0} matches across ` +
-          `${data.leaguesProcessed ?? 0} leagues (${data.teamsCoveredByTable ?? 0} teams covered, ` +
-          `${data.requestsUsed ?? 0} API calls used)`,
-          'success'
-        )
+        addLog(`TSDB done — enriched: ${data.enriched ?? 0} matches`, 'success')
         setTsdbStatus('success')
       }
     } catch (err) {
@@ -202,18 +255,60 @@ export default function AdminPage() {
     }
   }
 
+  async function runXgScraper() {
+    setXgStatus('loading')
+    setXgResult(null)
+    addLog('Scraping xG from Understat + FBref …')
+    try {
+      const res  = await fetch('/api/admin/scrape-xg')
+      const data = await res.json() as XgResult
+      setXgResult(data)
+      if (data.error) {
+        addLog(`xG scraper error: ${data.error}`, 'error')
+        setXgStatus('error')
+      } else {
+        addLog(
+          `xG scrape done — understat: ${data.results?.understat ?? 0}, fbref: ${data.results?.fbref ?? 0} records`,
+          'success'
+        )
+        setXgStatus('success')
+        loadScraperStatus()
+      }
+    } catch (err) {
+      addLog(`xG network error: ${err instanceof Error ? err.message : String(err)}`, 'error')
+      setXgStatus('error')
+    }
+  }
+
+  async function runOddsSnapshot() {
+    setOddsSnapStatus('loading')
+    setOddsSnapResult(null)
+    addLog('Snapshotting draw odds from The-Odds-API …')
+    try {
+      const res  = await fetch('/api/admin/scrape-odds-snapshot')
+      const data = await res.json() as OddsSnapshotResult
+      setOddsSnapResult(data)
+      if (data.error) {
+        addLog(`Odds snapshot error: ${data.error}`, 'error')
+        setOddsSnapStatus('error')
+      } else {
+        addLog(`Odds snapshot done — ${data.snapshots ?? 0} per-bookmaker snapshots saved`, 'success')
+        setOddsSnapStatus('success')
+        loadScraperStatus()
+      }
+    } catch (err) {
+      addLog(`Odds snapshot error: ${err instanceof Error ? err.message : String(err)}`, 'error')
+      setOddsSnapStatus('error')
+    }
+  }
+
   async function loadAccuracy() {
     setAccStatus('loading')
     try {
       const res  = await fetch('/api/model-accuracy')
       const data = await res.json()
-      if (data.error) {
-        addLog(`Accuracy error: ${data.error}`, 'error')
-        setAccStatus('error')
-        return
-      }
-      setAccuracy(data)
-      setAccStatus('success')
+      if (data.error) { addLog(`Accuracy error: ${data.error}`, 'error'); setAccStatus('error'); return }
+      setAccuracy(data); setAccStatus('success')
     } catch (err) {
       addLog(`Accuracy load error: ${err instanceof Error ? err.message : String(err)}`, 'error')
       setAccStatus('error')
@@ -263,6 +358,8 @@ export default function AdminPage() {
   const green   = 'var(--radar-green)'
   const orange  = '#fb923c'
   const teal    = '#2dd4bf'
+  const purple  = '#c084fc'
+  const blue    = '#60a5fa'
 
   const buildSignalRows = (si: AccuracyData['signalImpact']) => {
     const rows: Array<{ label: string; count: number; hitRate: number | null }> = [
@@ -276,16 +373,23 @@ export default function AdminPage() {
     return rows
   }
 
-  // ── Cron timeline helper ────────────────────────────────────────────────────
+  const statusDot = (s: ScraperRun['status']) => ({
+    running: { color: orange, label: 'running' },
+    done:    { color: green,  label: 'done' },
+    error:   { color: '#ef4444', label: 'error' },
+  }[s])
+
+  // Cron timeline
   const cronSteps = [
-    { time: '06:00', label: 'AllSportsAPI', color: orange, step: '1b' },
+    { time: '05:00', label: 'xG scrape',    color: blue,   step: '0' },
+    { time: '06:00', label: 'AllSports',    color: orange, step: '1b' },
     { time: '06:30', label: 'TSDB Enrich',  color: teal,   step: '1c' },
-    { time: '07:00', label: 'Main pipeline', color: green, step: '2'  },
+    { time: '07:00', label: 'Main pipeline',color: green,  step: '2'  },
+    { time: '*/4h',  label: 'Odds snap',    color: purple, step: '∞'  },
   ]
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--radar-bg)', color: 'var(--radar-text)' }}>
-      {/* Header */}
       <header className="border-b px-6 py-4 flex items-center gap-3"
         style={{ borderColor: border, background: surface }}>
         <a href="/" style={{ color: green, fontSize: 13 }}>← Home</a>
@@ -316,6 +420,96 @@ export default function AdminPage() {
               </div>
             ))}
           </div>
+        </section>
+
+        {/* ── NEW: Scraper health panel ── */}
+        <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="font-semibold flex items-center gap-2">
+              Scraper health
+              <button onClick={loadScraperStatus} className="text-xs px-2 py-0.5 rounded"
+                style={{ background: 'rgba(0,255,135,0.1)', color: green, border: '1px solid rgba(0,255,135,0.3)' }}>
+                ↻ Refresh
+              </button>
+            </h2>
+          </div>
+
+          {scraperStatus && (
+            <>
+              {/* Stats row */}
+              <div className="grid grid-cols-4 gap-2 mb-4">
+                {[
+                  { label: 'xG records',     value: scraperStatus.stats.rawXgTotal },
+                  { label: 'xG linked',       value: scraperStatus.stats.rawXgLinked },
+                  { label: 'Odds snapshots',  value: scraperStatus.stats.oddsSnapshots },
+                  { label: 'Matches w/ xG',   value: scraperStatus.stats.matchesWithXg },
+                ].map(s => (
+                  <div key={s.label} className="rounded-lg p-2 text-center" style={{ background: 'var(--radar-bg)' }}>
+                    <p className="text-base font-bold" style={{ color: blue }}>{s.value}</p>
+                    <p className="text-xs mt-0.5" style={{ color: muted }}>{s.label}</p>
+                  </div>
+                ))}
+              </div>
+
+              {/* Run statuses */}
+              {scraperStatus.scraperRuns.length > 0 && (
+                <div className="flex flex-col gap-1">
+                  {scraperStatus.scraperRuns.map(r => {
+                    const dot = statusDot(r.status)
+                    const ago = r.started_at
+                      ? Math.round((Date.now() - new Date(r.started_at).getTime()) / 60_000)
+                      : null
+                    return (
+                      <div key={r.id} className="flex items-center gap-2 text-xs px-2 py-1 rounded"
+                        style={{ background: 'var(--radar-bg)' }}>
+                        <span style={{ color: dot.color }}>●</span>
+                        <span style={{ color: 'var(--radar-text)', minWidth: 120 }}>{r.source}/{r.run_type}</span>
+                        <span style={{ color: dot.color }}>{dot.label}</span>
+                        <span style={{ color: muted, marginLeft: 'auto' }}>
+                          {r.records_upserted} records
+                          {ago !== null ? ` · ${ago}m ago` : ''}
+                        </span>
+                        {r.error_message && (
+                          <span style={{ color: '#ef4444', marginLeft: 4 }} title={r.error_message}>⚠</span>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Manual trigger buttons */}
+          <div className="flex gap-2 mt-4 flex-wrap">
+            <button onClick={runXgScraper} disabled={xgStatus === 'loading'}
+              className="px-4 py-1.5 rounded text-xs font-medium"
+              style={{
+                background: xgStatus === 'loading' ? 'rgba(255,255,255,0.05)' : 'rgba(96,165,250,0.1)',
+                color: xgStatus === 'loading' ? muted : blue,
+                border: `1px solid ${xgStatus === 'loading' ? border : 'rgba(96,165,250,0.3)'}`,
+                cursor: xgStatus === 'loading' ? 'not-allowed' : 'pointer',
+              }}>
+              {xgStatus === 'loading' ? 'Scraping xG…' : xgStatus === 'success' ? `xG ✓ (${xgResult?.totalRecords})` : '⚡ Scrape xG'}
+            </button>
+
+            <button onClick={runOddsSnapshot} disabled={oddsSnapStatus === 'loading'}
+              className="px-4 py-1.5 rounded text-xs font-medium"
+              style={{
+                background: oddsSnapStatus === 'loading' ? 'rgba(255,255,255,0.05)' : 'rgba(192,132,252,0.1)',
+                color: oddsSnapStatus === 'loading' ? muted : purple,
+                border: `1px solid ${oddsSnapStatus === 'loading' ? border : 'rgba(192,132,252,0.3)'}`,
+                cursor: oddsSnapStatus === 'loading' ? 'not-allowed' : 'pointer',
+              }}>
+              {oddsSnapStatus === 'loading' ? 'Snapshotting…' : oddsSnapStatus === 'success' ? `Odds ✓ (${oddsSnapResult?.snapshots})` : '📸 Snapshot odds'}
+            </button>
+          </div>
+
+          {xgResult?.errors && xgResult.errors > 0 && (
+            <p className="mt-2 text-xs" style={{ color: '#ef4444' }}>
+              {xgResult.errors} scraper(s) had errors — check console logs
+            </p>
+          )}
         </section>
 
         {/* Step 1 — Clear */}
@@ -359,7 +553,6 @@ export default function AdminPage() {
             }}>
             {asStatus === 'loading' ? 'Fetching…' : asStatus === 'success' ? 'Fetched ✓' : '⚡ Fetch AllSports'}
           </button>
-
           {asResult && asStatus === 'success' && (
             <div className="mt-3 grid grid-cols-4 gap-2">
               {[
@@ -375,15 +568,9 @@ export default function AdminPage() {
               ))}
             </div>
           )}
-          {asResult?.message && asStatus === 'success' && (
-            <p className="mt-2 text-xs" style={{ color: muted }}>{asResult.message}</p>
-          )}
-          {asResult?.error && asStatus === 'error' && (
-            <p className="mt-2 text-xs font-mono" style={{ color: '#ef4444' }}>{asResult.error}</p>
-          )}
         </section>
 
-        {/* Step 1c — TheSportsDB Enrichment */}
+        {/* Step 1c — TSDB */}
         <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
           <h2 className="font-semibold mb-1 flex items-center gap-2">
             Step 1c — TheSportsDB enrichment
@@ -392,15 +579,9 @@ export default function AdminPage() {
               06:30 UTC
             </span>
           </h2>
-          <p className="text-sm mb-1" style={{ color: muted }}>
-            Reads today's matches already in the DB and enriches them with <strong>real draw rates</strong>,
-            goals averages and form from TheSportsDB league standings (<code>lookuptable</code>).
-            Also updates <code>avg_draw_rate</code> on league rows from live data.
-          </p>
-          <p className="text-xs mb-4" style={{ color: muted }}>
-            Free key <code>123</code> — 30 req/min. Returns top 5 table rows per league.
+          <p className="text-sm mb-4" style={{ color: muted }}>
+            Reads today's matches and enriches with real draw rates + goals averages from standings.
             Sets <code>has_real_team_stats = true</code> on enriched matches.
-            Uses <code>TSDB_API_KEY</code> env var (falls back to <code>123</code>).
           </p>
           <button onClick={runTSDBEnrich} disabled={tsdbStatus === 'loading'}
             className="px-5 py-2 rounded font-medium text-sm transition-all"
@@ -412,38 +593,20 @@ export default function AdminPage() {
             }}>
             {tsdbStatus === 'loading' ? 'Enriching…' : tsdbStatus === 'success' ? 'Enriched ✓' : '📊 Run TSDB Enrich'}
           </button>
-
           {tsdbResult && tsdbStatus === 'success' && (
-            <div className="mt-3 flex flex-col gap-2">
-              <div className="grid grid-cols-4 gap-2">
-                {[
-                  { label: 'Enriched',  value: tsdbResult.enriched ?? 0 },
-                  { label: 'Leagues',   value: tsdbResult.leaguesProcessed ?? 0 },
-                  { label: 'Teams',     value: tsdbResult.teamsCoveredByTable ?? 0 },
-                  { label: 'API calls', value: tsdbResult.requestsUsed ?? 0 },
-                ].map((s) => (
-                  <div key={s.label} className="rounded-lg p-2 text-center" style={{ background: 'var(--radar-bg)' }}>
-                    <p className="text-base font-bold" style={{ color: teal }}>{s.value}</p>
-                    <p className="text-xs mt-0.5" style={{ color: muted }}>{s.label}</p>
-                  </div>
-                ))}
-              </div>
-              {tsdbResult.budget && (
-                <div className="rounded p-2 flex gap-4 text-xs" style={{ background: 'var(--radar-bg)' }}>
-                  <span style={{ color: muted }}>Rate limit:</span>
-                  <span style={{ color: teal }}>{tsdbResult.budget.used}/30 used this minute</span>
-                  <span style={{ color: muted }}>{tsdbResult.budget.remaining} remaining</span>
+            <div className="mt-3 grid grid-cols-4 gap-2">
+              {[
+                { label: 'Enriched',  value: tsdbResult.enriched ?? 0 },
+                { label: 'Leagues',   value: tsdbResult.leaguesProcessed ?? 0 },
+                { label: 'Teams',     value: tsdbResult.teamsCoveredByTable ?? 0 },
+                { label: 'API calls', value: tsdbResult.requestsUsed ?? 0 },
+              ].map((s) => (
+                <div key={s.label} className="rounded-lg p-2 text-center" style={{ background: 'var(--radar-bg)' }}>
+                  <p className="text-base font-bold" style={{ color: teal }}>{s.value}</p>
+                  <p className="text-xs mt-0.5" style={{ color: muted }}>{s.label}</p>
                 </div>
-              )}
-              {tsdbResult.leagueDrawRatesUpdated ? (
-                <p className="text-xs" style={{ color: muted }}>
-                  Updated live avg_draw_rate on {tsdbResult.leagueDrawRatesUpdated} league(s)
-                </p>
-              ) : null}
+              ))}
             </div>
-          )}
-          {tsdbResult?.error && tsdbStatus === 'error' && (
-            <p className="mt-2 text-xs font-mono" style={{ color: '#ef4444' }}>{tsdbResult.error}</p>
           )}
         </section>
 
@@ -458,15 +621,9 @@ export default function AdminPage() {
           </h2>
           <p className="text-sm mb-2" style={{ color: muted }}>
             Fetches API-Football fixtures + odds, team stats, H2H, form, scores ALL matches in DB
-            (including AllSports rows from 1b, enriched by TSDB from 1c), then saves top-10 predictions.
+            (including AllSports rows from 1b, enriched by TSDB from 1c + xG from Understat/FBref),
+            then saves top-10 predictions.
           </p>
-          <ul className="text-xs mb-4 list-disc list-inside" style={{ color: muted }}>
-            <li>Real H2H draw rate (weighted, recent-biased)</li>
-            <li>Form streak — weighted last-5 draw rate + goals avg</li>
-            <li>Fatigue proxy — games in last 14 days</li>
-            <li>Line movement — opening vs current odds</li>
-            <li>Platt-scaled confidence (identity until calibrated)</li>
-          </ul>
           <div className="flex gap-3 items-center">
             <button onClick={runPipeline} disabled={status === 'loading'}
               className="px-5 py-2 rounded font-medium text-sm transition-all"
@@ -500,7 +657,7 @@ export default function AdminPage() {
             </h2>
             <button onClick={updateAccuracy} disabled={accStatus === 'loading'}
               className="text-xs px-3 py-1 rounded font-medium"
-              style={{ background: 'rgba(59,130,246,0.1)', color: '#60a5fa', border: '1px solid rgba(59,130,246,0.3)' }}>
+              style={{ background: 'rgba(59,130,246,0.1)', color: blue, border: '1px solid rgba(59,130,246,0.3)' }}>
               Update accuracy
             </button>
           </div>
@@ -509,9 +666,9 @@ export default function AdminPage() {
             <div className="flex flex-col gap-4">
               <div className="grid grid-cols-3 gap-3">
                 {[
-                  { label: 'Overall hit rate',    value: `${accuracy.hitRate}%`,                                               color: green },
-                  { label: 'High conf (≥70%)',    value: accuracy.highConfHitRate ? `${accuracy.highConfHitRate}%` : '—',      color: '#f59e0b' },
-                  { label: 'Evaluated / pending', value: `${accuracy.totalEvaluated} / ${accuracy.unevaluated}`,              color: 'var(--radar-text)' },
+                  { label: 'Overall hit rate',    value: `${accuracy.hitRate}%`,                                          color: green },
+                  { label: 'High conf (≥70%)',    value: accuracy.highConfHitRate ? `${accuracy.highConfHitRate}%` : '—', color: '#f59e0b' },
+                  { label: 'Evaluated / pending', value: `${accuracy.totalEvaluated} / ${accuracy.unevaluated}`,         color: 'var(--radar-text)' },
                 ].map((s) => (
                   <div key={s.label} className="rounded-lg p-3 text-center" style={{ background: 'var(--radar-bg)' }}>
                     <p className="text-lg font-bold" style={{ color: s.color }}>{s.value}</p>
@@ -553,30 +710,6 @@ export default function AdminPage() {
                       </div>
                     ))}
                   </div>
-                  {accuracy.signalImpact.sweetSpotOdds.count > 0 && (
-                    <div className="rounded p-2 flex justify-between items-center mt-2"
-                      style={{ background: 'rgba(0,255,135,0.05)', border: '1px solid rgba(0,255,135,0.2)' }}>
-                      <span className="text-xs" style={{ color: muted }}>
-                        Odds sweet spot ({accuracy.signalImpact.sweetSpotOdds.range})
-                      </span>
-                      <span className="text-sm font-bold" style={{ color: green }}>
-                        {accuracy.signalImpact.sweetSpotOdds.hitRate ?? '—'}%
-                        <span className="text-xs font-normal ml-1" style={{ color: muted }}>({accuracy.signalImpact.sweetSpotOdds.count})</span>
-                      </span>
-                    </div>
-                  )}
-                  {accuracy.signalImpact.midRangeOdds && accuracy.signalImpact.midRangeOdds.count > 0 && (
-                    <div className="rounded p-2 flex justify-between items-center mt-1"
-                      style={{ background: 'var(--radar-bg)', border: `1px solid ${border}` }}>
-                      <span className="text-xs" style={{ color: muted }}>
-                        Mid-range odds ({accuracy.signalImpact.midRangeOdds.range})
-                      </span>
-                      <span className="text-sm font-bold" style={{ color: '#f59e0b' }}>
-                        {accuracy.signalImpact.midRangeOdds.hitRate ?? '—'}%
-                        <span className="text-xs font-normal ml-1" style={{ color: muted }}>({accuracy.signalImpact.midRangeOdds.count})</span>
-                      </span>
-                    </div>
-                  )}
                 </div>
               )}
 
@@ -601,9 +734,6 @@ export default function AdminPage() {
                         </div>
                       )
                     })}
-                    <p className="text-xs mt-1" style={{ color: muted }}>
-                      Green bar = actual · Yellow line = predicted · Diff = actual − predicted
-                    </p>
                   </div>
                 </div>
               )}
@@ -637,13 +767,13 @@ export default function AdminPage() {
         <section className="rounded-xl p-6" style={{ background: surface, border: `1px solid ${border}` }}>
           <h2 className="font-semibold mb-1">Step 4 — Calibrate confidence (monthly)</h2>
           <p className="text-sm mb-4" style={{ color: muted }}>
-            Fits Platt scaling from <code>was_correct</code> data. Run once you have ≥20 evaluated predictions. Repeat monthly.
+            Fits Platt scaling from <code>was_correct</code> data. Run once you have ≥20 evaluated predictions.
           </p>
           <button onClick={calibrateModel} disabled={calStatus === 'loading'}
             className="px-5 py-2 rounded font-medium text-sm transition-all"
             style={{
               background: calStatus === 'loading' ? 'rgba(255,255,255,0.05)' : 'rgba(168,85,247,0.1)',
-              color: calStatus === 'loading' ? muted : '#c084fc',
+              color: calStatus === 'loading' ? muted : purple,
               border: `1px solid ${calStatus === 'loading' ? border : 'rgba(168,85,247,0.3)'}`,
               cursor: calStatus === 'loading' ? 'not-allowed' : 'pointer',
             }}>
@@ -652,13 +782,8 @@ export default function AdminPage() {
           {calResult?.success && (
             <div className="mt-3 rounded-lg p-3 text-xs" style={{ background: 'var(--radar-bg)' }}>
               <p style={{ color: green }}>a={calResult.plattA} · b={calResult.plattB}</p>
-              <p style={{ color: muted }}>
-                Overall hit rate: {calResult.overallHitRate}% · Well-calibrated: {calResult.isWellCalibrated ? 'yes' : 'needs more data'}
-              </p>
+              <p style={{ color: muted }}>Overall hit rate: {calResult.overallHitRate}%</p>
             </div>
-          )}
-          {calResult && !calResult.success && (
-            <p className="mt-2 text-xs" style={{ color: muted }}>{calResult.message}</p>
           )}
         </section>
 

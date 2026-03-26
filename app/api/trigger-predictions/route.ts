@@ -116,6 +116,8 @@ async function upsertTodayMatches(today: string, apiKey: string): Promise<number
   console.log(`[pipeline] Fetching odds sequentially for ${fixtureIds.length} fixtures (~${Math.ceil(fixtureIds.length * 6.5 / 60)}min)…`)
   const oddsMap = await fetchOddsForFixtures(apiKey, fixtureIds)
 
+
+  
   const fixturesWithOdds = toProcess
     .map(fixture => {
       const extId = `apifb_${fixture.fixture.id}`

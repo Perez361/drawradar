@@ -1,16 +1,29 @@
 {
   "crons": [
     {
+      "path": "/api/admin/scrape-xg",
+      "schedule": "0 5 * * *",
+      "description": "Scrape xG from Understat + FBref (no API key, free)"
+    },
+    {
       "path": "/api/admin/allsports-fixtures",
-      "schedule": "0 6 * * *"
+      "schedule": "0 6 * * *",
+      "description": "Fetch fixtures + draw odds from AllSportsAPI"
     },
     {
       "path": "/api/admin/tsdb-enrich",
-      "schedule": "30 6 * * *"
+      "schedule": "30 6 * * *",
+      "description": "Enrich matches with real team draw rates from TheSportsDB"
     },
     {
       "path": "/api/trigger-predictions",
-      "schedule": "0 7 * * *"
+      "schedule": "0 7 * * *",
+      "description": "Main pipeline: API-Football fixtures, stats, H2H → score all matches → top-10 predictions"
+    },
+    {
+      "path": "/api/admin/scrape-odds-snapshot",
+      "schedule": "0 */4 * * *",
+      "description": "Snapshot draw odds every 4 hours for line movement tracking"
     }
   ]
 }
