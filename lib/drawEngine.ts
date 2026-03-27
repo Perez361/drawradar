@@ -1,45 +1,123 @@
-// ─── Draw Engine v5 ───────────────────────────────────────────────────────────
+// ─── Draw Engine v6 ───────────────────────────────────────────────────────────
 //
-// Fixes and improvements over v4:
-//   1. Continuous weighted scoring — no discrete integer steps, scores are now
-//      genuine floats across 0–10 enabling real ranking differentiation
-//   2. formScore rebalanced: cap raised from 1.5 → 2.0, goals sub-component
-//      raised from 0.5 → 1.0. Form now peers with odds as a primary signal.
-//   3. leagueScore floor fixed: was (rate - 0.24) / 0.10 → any league at
-//      avgDrawRate ≤ 0.24 scored 0. Now uses a proper clamp to [0, 1.5] with
-//      a 0.22 baseline so even average leagues get partial credit.
-//   4. H2H weighting: real H2H now scores up to 1.5 (was 1.0) while estimated
-//      H2H is capped at 0.5. Reward real data more aggressively.
-//   5. Odds sweet-spot bands tightened: 3.05–3.45 → 2.5pts (market consensus
-//      on draw), 2.75–3.05 and 3.45–3.75 → 1.2pts, else 0 — removes the
-//      arbitrary cliff at 4.0 and scores more consistently.
-//   6. Line-movement signal sharpened: a drift > +0.30 now gets −1.0 (was
-//      −0.5) since sharp fade on draw is a strong contra-signal.
-//   7. Platt identity check now uses Number.EPSILON comparison, not exact ===
-//      which fails after DB round-trip float serialisation.
-//   8. scoreToConfidence now uses a monotone piece-wise linear map derived
-//      from the raw sigmoid so pre- and post-calibration values are coherent.
-//   9. poissonDrawProbability maxGoals cap raised: uses dynamic ceiling based
-//      on actual lambda rather than a fixed heuristic, reducing undercount on
-//      high-scoring matches.
-//  10. Input validation added: xG and odds are now sanitized to prevent edge cases.
+// Philosophy: Weight signals by DATA QUALITY, not perceived importance.
+//
+// Previous versions scored 10+ components, but most fed on league baselines
+// (fake xG, fake H2H, fake team draw rates). This created false precision —
+// a confident-looking score built mostly on averages applied to every match.
+//
+// v6 is brutally honest about what we know vs. what we're guessing:
+//
+//   TIER 1 — Real data (always available):
+//     • Market odds (what sharp money says)
+//     • Poisson from xG (real when scraped, baseline when not)
+//
+//   TIER 2 — Sometimes real:
+//     • Form draw rate (API-Football, when available)
+//     • Real H2H (5+ matches, when available)
+//     • Real team draw rates (TSDB-enriched, when available)
+//
+//   TIER 3 — Always fake (league baselines):
+//     • Everything else: estimated H2H, league avg draw rate, etc.
+//     → These get near-zero weight. They add noise, not signal.
+//
+// The score is now a weighted average of quality-gated signals.
+// A match with only baseline data scores near the middle — honestly uncertain.
+// A match with real H2H + real form + good odds scores confidently.
+//
+// This makes the model CALIBRATED: low confidence when data is sparse,
+// high confidence only when multiple real signals align.
 
-// ─── Shared constants ─────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-// Form weights: most recent game = 1.0, decreasing for older games
-export const FORM_WEIGHTS = [1.0, 0.9, 0.8, 0.7, 0.6]
+export interface DrawFeatures {
+  // Core market signal
+  drawOdds: number
+  homeOdds?: number
+  awayOdds?: number
+  oddsOpenDraw?: number
+  oddsMovement?: number
 
-// H2H weights: recent 5 matches get 2x weight, older 5 get 1x
-const H2H_RECENT_WEIGHT = 2
-const H2H_OLD_WEIGHT = 1
+  // xG — real when scraped from Understat/FBref, estimated otherwise
+  xgHome: number
+  xgAway: number
+  xgIsReal?: boolean          // true if from Understat/FBref scraper
 
-// ─── Poisson helpers ──────────────────────────────────────────────────────────
+  // Form — real when from API-Football recent fixtures
+  homeFormDrawRate?: number   // undefined = no data
+  awayFormDrawRate?: number
+  homeFormGoalsAvg?: number
+  awayFormGoalsAvg?: number
+  homeGamesLast14?: number
+  awayGamesLast14?: number
+
+  // H2H — real when h2h_is_real = true (5+ real matches)
+  h2hDrawRate: number
+  h2hIsReal: boolean
+
+  // Team draw rates — real when has_real_team_stats = true (TSDB-enriched)
+  homeDrawRate: number
+  awayDrawRate: number
+  hasRealTeamStats?: boolean  // true when TSDB enrichment succeeded
+
+  // Goal averages — real when has_real_team_stats = true
+  homeGoalsAvg: number
+  awayGoalsAvg: number
+  homeConcedeAvg: number
+  awayConcedeAvg: number
+
+  // League context (always a baseline — lowest weight tier)
+  leagueAvgDrawRate: number
+  leagueDrawBoost?: number
+}
+
+export interface DrawPrediction {
+  poissonProb: number
+  probability: number
+  drawScore: number       // 0–10
+  confidence: number      // 15–85%
+  edge: number
+  dataQuality: DataQuality
+  breakdown: SignalBreakdown
+}
+
+export interface DataQuality {
+  tier: 'high' | 'medium' | 'low'
+  realSignalCount: number   // how many Tier 1/2 signals fired
+  hasRealXg: boolean
+  hasRealForm: boolean
+  hasRealH2H: boolean
+  hasRealTeamStats: boolean
+  qualityScore: number      // 0–1, drives confidence range
+}
+
+export interface SignalBreakdown {
+  marketSignal: number      // from odds — always present
+  poissonSignal: number     // from xG
+  formSignal: number | null // null if no real form data
+  h2hSignal: number | null  // null if no real H2H
+  teamDrawSignal: number | null // null if no real team stats
+}
+
+// ─── Platt scaling ────────────────────────────────────────────────────────────
+
+let PLATT_A = -1.0
+let PLATT_B = 0.0
+
+export function setPlattParams(a: number, b: number) {
+  PLATT_A = a
+  PLATT_B = b
+}
+
+function isCalibrated(): boolean {
+  return !(Math.abs(PLATT_A - (-1.0)) < 1e-4 && Math.abs(PLATT_B - 0.0) < 1e-4)
+}
+
+// ─── Poisson ──────────────────────────────────────────────────────────────────
 
 function factorial(n: number): number {
   if (n <= 1) return 1
-  // Stirling above 20 is faster and accurate enough for Poisson
   if (n > 20) {
-    // Use log-factorial via Stirling for large n
     let logFact = 0
     for (let i = 2; i <= n; i++) logFact += Math.log(i)
     return Math.exp(logFact)
@@ -55,7 +133,6 @@ function poisson(lambda: number, k: number): number {
 }
 
 export function poissonDrawProbability(xgHome: number, xgAway: number): number {
-  // Dynamic ceiling: enough goals to capture 99.9% of mass under the higher λ
   const maxLambda = Math.max(xgHome, xgAway)
   const maxGoals = Math.max(8, Math.ceil(maxLambda + 4 * Math.sqrt(maxLambda) + 2))
   let prob = 0
@@ -65,331 +142,325 @@ export function poissonDrawProbability(xgHome: number, xgAway: number): number {
   return Math.min(prob, 0.99)
 }
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export interface DrawFeatures {
-  // Core xG model
-  xgHome: number
-  xgAway: number
-  // Team stats
-  homeGoalsAvg: number
-  awayGoalsAvg: number
-  homeConcedeAvg: number
-  awayConcedeAvg: number
-  // Draw history
-  homeDrawRate: number
-  awayDrawRate: number
-  h2hDrawRate: number
-  h2hIsReal: boolean
-  // Market
-  drawOdds: number
-  homeOdds: number
-  awayOdds: number
-  oddsOpenDraw?: number
-  oddsMovement?: number
-  // Form (last 5 weighted)
-  homeFormDrawRate?: number
-  awayFormDrawRate?: number
-  homeFormGoalsAvg?: number
-  awayFormGoalsAvg?: number
-  // Fatigue
-  homeGamesLast14?: number
-  awayGamesLast14?: number
-  // League context
-  leagueAvgDrawRate: number
-  leagueDrawBoost?: number
-}
-
-export interface DrawPrediction {
-  poissonProb: number
-  probability: number
-  drawScore: number
-  confidence: number
-  edge: number
-  breakdown: DrawBreakdown
-}
-
-export interface DrawBreakdown {
-  poissonScore: number
-  parityScore: number
-  formScore: number
-  h2hScore: number
-  oddsScore: number
-  fatigueScore: number
-  lineMovementScore: number
-  leagueScore: number
-}
-
-// ─── Platt scaling ────────────────────────────────────────────────────────────
+// ─── Signal: Market (TIER 1 — always real) ────────────────────────────────────
 //
-// Default a=-1.0, b=0.0 represents the uncalibrated sigmoid — NOT identity.
-// We detect "uncalibrated" via near-equality with epsilon tolerance to handle
-// DB float serialisation rounding (e.g. -0.9999999 from NUMERIC(8,4)).
+// The market is the single most reliable draw signal we have.
+// Sharp books like Pinnacle set odds based on vast data.
+// We treat their implied probability as a prior, then look for edge.
+//
+// Signal interpretation:
+//   odds 3.05–3.45 → market consensus "draw is live" (25–30% implied prob)
+//   odds 2.75–3.05 → market slightly favors draw, may be worth taking
+//   odds 3.45–3.75 → market less convinced, but not dead
+//   outside range  → market doesn't see it; strong contra-signal
+//
+// Line movement adds information:
+//   odds shortened → sharp money backing draw
+//   odds drifted  → sharp money fading draw
 
-let PLATT_A = -1.0
-let PLATT_B = 0.0
+function computeMarketSignal(
+  drawOdds: number,
+  oddsMovement?: number
+): { signal: number; impliedProb: number } {
+  const impliedProb = 1 / drawOdds
 
-export function setPlattParams(a: number, b: number) {
-  PLATT_A = a
-  PLATT_B = b
-}
+  // Base signal from odds zone (0–1 scale)
+  let baseSignal: number
+  if (drawOdds >= 3.05 && drawOdds <= 3.45)      baseSignal = 0.85  // prime zone
+  else if (drawOdds >= 2.85 && drawOdds < 3.05)   baseSignal = 0.70  // slightly short
+  else if (drawOdds > 3.45 && drawOdds <= 3.75)   baseSignal = 0.60  // slight drift
+  else if (drawOdds >= 2.65 && drawOdds < 2.85)   baseSignal = 0.45  // overpriced by market
+  else if (drawOdds > 3.75 && drawOdds <= 4.10)   baseSignal = 0.35  // long shot
+  else                                              baseSignal = 0.10  // outside useful range
 
-function isCalibrated(): boolean {
-  return !(
-    Math.abs(PLATT_A - (-1.0)) < 1e-4 &&
-    Math.abs(PLATT_B - 0.0) < 1e-4
-  )
-}
+  // Line movement modifier
+  let movementMod = 0
+  if (oddsMovement !== undefined && oddsMovement !== null) {
+    if (oddsMovement < -0.20) movementMod = +0.12  // sharp steam toward draw
+    else if (oddsMovement < -0.08) movementMod = +0.06
+    else if (oddsMovement > 0.30)  movementMod = -0.15  // strong fade
+    else if (oddsMovement > 0.12)  movementMod = -0.08
+  }
 
-function plattScale(rawProb: number): number {
-  // Apply Platt sigmoid: P_calibrated = 1 / (1 + exp(A * raw + B))
-  return 1 / (1 + Math.exp(PLATT_A * rawProb + PLATT_B))
-}
-
-// ─── Component scorers ────────────────────────────────────────────────────────
-
-/**
- * Poisson component: maps draw probability to a 0–2 contribution.
- * Uses a logistic-style curve so scores cluster more around 1 and
- * only extreme cases (very balanced xG, low totals) hit the ceiling.
- */
-function computePoissonScore(poissonProb: number): number {
-  // Reference: league average draw prob ≈ 0.27. Score 1.0 at 0.27,
-  // score 2.0 asymptotically near 0.50, score 0 near 0.15.
-  const normalised = (poissonProb - 0.15) / (0.45 - 0.15)  // 0 at 15%, 1 at 45%
-  return Math.max(0, Math.min(2.0, normalised * 2.0))
-}
-
-/**
- * Team parity: measures how evenly matched the two teams are in both
- * season stats and xG. Returns 0–3 (1.5 from stats, 1.5 from xG).
- */
-function computeParityScore(f: DrawFeatures): number {
-  const goalsDiff = Math.abs(f.homeGoalsAvg - f.awayGoalsAvg)
-  // Exponential decay: symmetric teams → max score
-  const statsParity = 1.5 * Math.exp(-goalsDiff / 0.30)
-
-  const xgDiff = Math.abs(f.xgHome - f.xgAway)
-  const xgParity = 1.5 * Math.exp(-xgDiff / 0.25)
-
-  return statsParity + xgParity
-}
-
-/**
- * Low-scoring tendency: draws correlate strongly with total goals below 2.5.
- * Also rewards mutual defensive records (low concede averages).
- * Returns 0–2.5.
- */
-function computeLowScoringScore(f: DrawFeatures): number {
-  const totalGoals = f.homeGoalsAvg + f.awayGoalsAvg
-  // Peaks at ~1.8 total (tight games), falls off sharply above 3.0
-  const goalsScore = 2.0 * Math.exp(-Math.max(0, totalGoals - 1.5) / 1.2)
-
-  // Bonus for defensive solidity on both sides
-  const concede = (f.homeConcedeAvg + f.awayConcedeAvg) / 2
-  const defenceScore = 0.5 * Math.exp(-Math.max(0, concede - 1.0) / 0.8)
-
-  return Math.min(2.5, goalsScore + defenceScore)
-}
-
-/**
- * H2H signal: real data weighted 3× versus estimate.
- * Returns 0–1.5 for real H2H, 0–0.5 for blended estimate.
- */
-function computeH2HScore(f: DrawFeatures): number {
-  if (f.h2hIsReal) {
-    // Real data: normalise around 0.27 league baseline
-    const excess = (f.h2hDrawRate - 0.22) / 0.20  // 0 at 22%, 1 at 42%
-    return Math.max(0, Math.min(1.5, excess * 1.5))
-  } else {
-    // Estimated (blend of team draw rates): reduced weight
-    const excess = (f.h2hDrawRate - 0.25) / 0.15
-    return Math.max(0, Math.min(0.5, excess * 0.5))
+  return {
+    signal: Math.max(0, Math.min(1, baseSignal + movementMod)),
+    impliedProb,
   }
 }
 
-/**
- * Team draw rates: season-long propensity to draw for each side.
- * Returns 0–2.0.
- */
-function computeTeamDrawScore(f: DrawFeatures): number {
-  const teamDrawAvg = (f.homeDrawRate + f.awayDrawRate) / 2
-  // Normalise: 0.22 = minimum meaningful, 0.42 = elite draw team
-  const normalised = (teamDrawAvg - 0.22) / (0.42 - 0.22)
-  return Math.max(0, Math.min(2.0, normalised * 2.0))
-}
+// ─── Signal: Poisson/xG (TIER 1 if real, TIER 3 if baseline) ─────────────────
+//
+// When xG is from Understat/FBref: high weight, reliable
+// When xG is estimated from goals averages: medium weight if real team stats,
+//   low weight if from league baselines
+//
+// Key insight: xG parity (|xgHome - xgAway| close to 0) predicts draws.
+// Low total xG (under 2.0) also favors draws.
 
-/**
- * Form streak: recent 5-game draw rate and goal scoring form.
- * Returns 0–3.0 (2.0 for draw rate, 1.0 for low recent scoring).
- * Rebalanced from v4: was capped at 2.0 total; form is now a primary signal.
- */
-function computeFormScore(f: DrawFeatures): number {
-  let score = 0
-
-  if (f.homeFormDrawRate !== undefined && f.awayFormDrawRate !== undefined) {
-    const formDrawAvg = (f.homeFormDrawRate + f.awayFormDrawRate) / 2
-    // 0.20 is a "cold" draw spell, 0.60 is a hot streak
-    const normalised = (formDrawAvg - 0.20) / (0.55 - 0.20)
-    score += Math.max(0, Math.min(2.0, normalised * 2.0))
-  }
-
-  if (f.homeFormGoalsAvg !== undefined && f.awayFormGoalsAvg !== undefined) {
-    const formGoals = f.homeFormGoalsAvg + f.awayFormGoalsAvg
-    // Low recent scoring is a leading indicator for draws
-    score += Math.max(0, Math.min(1.0, (3.5 - formGoals) / 2.5))
-  }
-
-  return Math.min(3.0, score)
-}
-
-/**
- * Odds sweet-spot: market consensus that draw is live.
- * Tighter bands than v4 and removes arbitrary hard cutoff.
- * Returns 0–2.5.
- */
-function computeOddsScore(drawOdds: number): number {
-  if (drawOdds >= 3.05 && drawOdds <= 3.45) return 2.5   // Market prime zone
-  if (drawOdds >= 2.75 && drawOdds < 3.05)  return 1.6   // Slightly short, still live
-  if (drawOdds > 3.45 && drawOdds <= 3.75)  return 1.2   // Slight drift, still viable
-  if (drawOdds > 3.75 && drawOdds <= 4.10)  return 0.5   // Long shot draws
-  return 0                                                 // Outside range — no value
-}
-
-/**
- * Line movement: sharp money signal from opening vs current odds.
- * Returns -1.0 to +1.5.
- */
-function computeLineMovementScore(oddsMovement?: number): number {
-  if (oddsMovement === undefined || oddsMovement === null) return 0
-  if (oddsMovement < -0.25) return 1.5   // Strong steam toward draw
-  if (oddsMovement < -0.10) return 0.8   // Moderate shortening
-  if (oddsMovement < -0.04) return 0.3   // Slight drift in
-  if (oddsMovement > 0.35)  return -1.0  // Strong fade — sharp money against draw
-  if (oddsMovement > 0.15)  return -0.5  // Moderate fade
-  return 0
-}
-
-/**
- * Fatigue proxy: fixture congestion in the last 14 days increases draw rates
- * as tired teams play conservatively.
- * Returns 0–0.8.
- */
-function computeFatigueScore(
-  homeGamesLast14?: number,
-  awayGamesLast14?: number
+function computePoissonSignal(
+  xgHome: number,
+  xgAway: number
 ): number {
-  if (homeGamesLast14 === undefined || awayGamesLast14 === undefined) return 0
-  const avgFatigue = (homeGamesLast14 + awayGamesLast14) / 2
-  if (avgFatigue >= 5) return 0.8
-  if (avgFatigue >= 4) return 0.6
-  if (avgFatigue >= 3) return 0.3
-  return 0
+  const drawProb = poissonDrawProbability(xgHome, xgAway)
+  // League draw rate baseline ≈ 0.27. Normalize around that.
+  // A draw prob of 0.27 → signal 0.5 (neutral)
+  // A draw prob of 0.35+ → signal near 1.0 (strongly positive)
+  // A draw prob of 0.18  → signal near 0.1 (negative)
+  const normalized = (drawProb - 0.15) / (0.40 - 0.15)
+  return Math.max(0, Math.min(1, normalized))
 }
 
-/**
- * League draw environment: some leagues structurally produce more draws.
- * Returns 0–1.5 + optional manual boost from DB.
- */
-function computeLeagueScore(
-  leagueAvgDrawRate: number,
-  leagueDrawBoost?: number
-): number {
-  // v4 bug: (rate - 0.24) / 0.10 → Bundesliga at exactly 0.24 = 0, unfair.
-  // New: continuous from 0.22 (low) to 0.38 (high). Full score at 0.35+.
-  const normalised = (leagueAvgDrawRate - 0.22) / (0.38 - 0.22)
-  const base = Math.max(0, Math.min(1.5, normalised * 1.5))
-  return base + (leagueDrawBoost ?? 0)
+// ─── Signal: Form (TIER 2 — real when from API-Football) ─────────────────────
+//
+// Recent form draw rate is a meaningful leading indicator.
+// If both teams have been drawing a lot recently, that pattern tends to persist.
+// Low recent scoring is a secondary form signal.
+//
+// Returns null if no real form data.
+
+function computeFormSignal(
+  homeFormDrawRate?: number,
+  awayFormDrawRate?: number,
+  homeFormGoalsAvg?: number,
+  awayFormGoalsAvg?: number
+): number | null {
+  if (homeFormDrawRate === undefined || awayFormDrawRate === undefined) return null
+
+  const avgFormDrawRate = (homeFormDrawRate + awayFormDrawRate) / 2
+  // Normalize: 0.20 = cold spell, 0.55 = hot draw streak
+  const drawRateSignal = Math.max(0, Math.min(1,
+    (avgFormDrawRate - 0.18) / (0.55 - 0.18)
+  ))
+
+  // Goals signal (low recent scoring predicts draws)
+  let goalsSignal = 0.5  // neutral if no data
+  if (homeFormGoalsAvg !== undefined && awayFormGoalsAvg !== undefined) {
+    const totalFormGoals = homeFormGoalsAvg + awayFormGoalsAvg
+    // 1.8 total is "tight game" territory, 3.5+ is "open game"
+    goalsSignal = Math.max(0, Math.min(1, (3.5 - totalFormGoals) / (3.5 - 1.8)))
+  }
+
+  // Blend: form draw rate is 2x more predictive than recent goals
+  return (drawRateSignal * 2 + goalsSignal) / 3
+}
+
+// ─── Signal: H2H (TIER 2 if real, TIER 3 if estimated) ───────────────────────
+//
+// Real H2H (5+ matches) carries meaningful signal — some fixtures
+// are structurally draw-prone regardless of form/league context.
+// Estimated H2H (blend of team draw rates) has near-zero added value.
+//
+// Returns null if H2H is not real (caller handles the weight difference).
+
+function computeH2HSignal(h2hDrawRate: number, h2hIsReal: boolean): number | null {
+  if (!h2hIsReal) return null  // estimated H2H adds no value over baseline
+
+  // Normalize: 0.20 = rarely draws, 0.50 = always draws
+  return Math.max(0, Math.min(1, (h2hDrawRate - 0.18) / (0.48 - 0.18)))
+}
+
+// ─── Signal: Team draw rates (TIER 2 if TSDB-enriched, TIER 3 otherwise) ──────
+//
+// Real team draw rates from league standings are genuinely predictive.
+// Estimated draw rates (league baseline applied to every team) are noise.
+//
+// Returns null if not real.
+
+function computeTeamDrawSignal(
+  homeDrawRate: number,
+  awayDrawRate: number,
+  hasRealTeamStats?: boolean
+): number | null {
+  if (!hasRealTeamStats) return null
+
+  const avgTeamDrawRate = (homeDrawRate + awayDrawRate) / 2
+  return Math.max(0, Math.min(1, (avgTeamDrawRate - 0.20) / (0.40 - 0.20)))
+}
+
+// ─── Data quality assessment ──────────────────────────────────────────────────
+
+function assessDataQuality(f: DrawFeatures): DataQuality {
+  const hasRealXg = f.xgIsReal === true
+  const hasRealForm = f.homeFormDrawRate !== undefined && f.awayFormDrawRate !== undefined
+  const hasRealH2H = f.h2hIsReal
+  const hasRealTeamStats = f.hasRealTeamStats === true
+
+  const realSignalCount = [hasRealXg, hasRealForm, hasRealH2H, hasRealTeamStats]
+    .filter(Boolean).length
+
+  // Quality score drives confidence range:
+  // 0 real signals → quality 0.2 (we're basically guessing)
+  // 1 real signal  → quality 0.4
+  // 2 real signals → quality 0.6
+  // 3 real signals → quality 0.8
+  // 4 real signals → quality 1.0
+  const qualityScore = 0.2 + (realSignalCount / 4) * 0.8
+
+  const tier: 'high' | 'medium' | 'low' =
+    realSignalCount >= 3 ? 'high' :
+    realSignalCount >= 1 ? 'medium' : 'low'
+
+  return {
+    tier,
+    realSignalCount,
+    hasRealXg,
+    hasRealForm,
+    hasRealH2H,
+    hasRealTeamStats,
+    qualityScore,
+  }
 }
 
 // ─── Core prediction ──────────────────────────────────────────────────────────
+//
+// Scoring approach:
+//   1. Compute each signal (returns null if no real data for tier 2)
+//   2. Build weighted average using quality-aware weights
+//   3. Scale confidence range by data quality
+//      → Low quality data = confidence capped at 50%
+//      → High quality data = confidence can reach 80%
+//   4. Apply Platt scaling when calibrated
 
 export function predictDraw(f: DrawFeatures): DrawPrediction {
-  // Validate and sanitize inputs
+  // Sanitize inputs
   const xgHome = Math.max(0.1, Math.min(5, f.xgHome ?? 1.2))
   const xgAway = Math.max(0.1, Math.min(5, f.xgAway ?? 1.2))
   const drawOdds = Math.max(1.5, Math.min(15, f.drawOdds ?? 3.2))
-  
+
   const poissonProb = poissonDrawProbability(xgHome, xgAway)
-  const impliedProb = 1 / drawOdds
 
-  // ── Component scores ──────────────────────────────────────────────────────
-  const poissonScore      = computePoissonScore(poissonProb)
-  const parityScore       = computeParityScore(f)
-  const lowScoringScore   = computeLowScoringScore(f)
-  const h2hScore          = computeH2HScore(f)
-  const teamDrawScore     = computeTeamDrawScore(f)
-  const formScore         = computeFormScore(f)
-  const oddsScore         = computeOddsScore(drawOdds)
-  const lineMovementScore = computeLineMovementScore(f.oddsMovement)
-  const fatigueScore      = computeFatigueScore(f.homeGamesLast14, f.awayGamesLast14)
-  const leagueScore       = computeLeagueScore(f.leagueAvgDrawRate, f.leagueDrawBoost)
+  // ── Compute all signals ──────────────────────────────────────────────────────
+  const { signal: marketSignal, impliedProb } = computeMarketSignal(drawOdds, f.oddsMovement)
+  const poissonSignal = computePoissonSignal(xgHome, xgAway)
+  const formSignal = computeFormSignal(f.homeFormDrawRate, f.awayFormDrawRate, f.homeFormGoalsAvg, f.awayFormGoalsAvg)
+  const h2hSignal = computeH2HSignal(f.h2hDrawRate, f.h2hIsReal)
+  const teamDrawSignal = computeTeamDrawSignal(f.homeDrawRate, f.awayDrawRate, f.hasRealTeamStats)
 
-  // ── Weighted raw score (target range 0–10) ────────────────────────────────
-  // Weights are calibrated so a "perfect" draw candidate hits ~9.5.
-  // Max possible: 2.0 + 3.0 + 2.5 + 1.5 + 2.0 + 3.0 + 2.5 + 1.5 + 0.8 + 1.5 = 20.3
-  // Scale factor: 10 / 20.3 ≈ 0.493 → multiply each component by weight then sum
-  const rawSum =
-    poissonScore      * 1.2 +   // xG-based Poisson: objective anchor
-    parityScore       * 1.0 +   // team strength parity
-    lowScoringScore   * 0.9 +   // low-scoring tendency
-    h2hScore          * 1.1 +   // H2H history (real > estimated)
-    teamDrawScore     * 0.9 +   // season-long draw affinity
-    formScore         * 1.0 +   // recent form (rebalanced)
-    oddsScore         * 1.0 +   // market sweet-spot
-    lineMovementScore * 0.8 +   // sharp money signal
-    fatigueScore      * 0.6 +   // fatigue proxy
-    leagueScore       * 0.5     // league draw environment
+  // ── Data quality ─────────────────────────────────────────────────────────────
+  const dq = assessDataQuality(f)
 
-  // Normalise to [0, 10]. The theoretical max with all weights above is ~20.3
-  // but practically ranges from 3 to 17 for real fixtures → use 0.65 scale factor
-  // which maps an excellent candidate (raw ≈ 15) to drawScore ≈ 9.8
-  const SCALE = 0.62
-  const drawScore = Math.min(10, Math.max(0, Math.round(rawSum * SCALE * 100) / 100))
+  // ── Weighted combination ──────────────────────────────────────────────────────
+  //
+  // TIER 1 weights (always present):
+  //   marketSignal:   0.45  — single most reliable signal
+  //   poissonSignal:  0.25 if real xG, 0.15 if estimated
+  //
+  // TIER 2 weights (when real data available, else excluded):
+  //   formSignal:     0.15 when real
+  //   h2hSignal:      0.10 when real
+  //   teamDrawSignal: 0.10 when real
+  //
+  // TIER 3 (league baseline fallback):
+  //   When no tier 2 signals available, distribute remaining weight
+  //   to market + poisson. This makes the model honest: "I only have
+  //   odds and league averages, so I'm uncertain."
 
-  // ── Blended draw probability ──────────────────────────────────────────────
-  const leaguePrior   = f.leagueAvgDrawRate
-  const h2hComponent  = f.h2hIsReal ? f.h2hDrawRate : leaguePrior
-  const teamDrawAvg   = (f.homeDrawRate + f.awayDrawRate) / 2
+  let weightedSum = 0
+  let totalWeight = 0
 
-  const blendedProb =
-    0.45 * poissonProb +
-    0.25 * impliedProb +
-    0.18 * h2hComponent +
-    0.12 * teamDrawAvg
+  // Market signal (TIER 1, always)
+  const marketWeight = 0.45
+  weightedSum += marketSignal * marketWeight
+  totalWeight += marketWeight
+
+  // Poisson signal (TIER 1 if real xG, reduced if estimated)
+  const poissonWeight = dq.hasRealXg ? 0.25 : 0.15
+  weightedSum += poissonSignal * poissonWeight
+  totalWeight += poissonWeight
+
+  // Form signal (TIER 2, only if real)
+  if (formSignal !== null) {
+    const formWeight = 0.15
+    weightedSum += formSignal * formWeight
+    totalWeight += formWeight
+  }
+
+  // H2H signal (TIER 2, only if real)
+  if (h2hSignal !== null) {
+    const h2hWeight = 0.10
+    weightedSum += h2hSignal * h2hWeight
+    totalWeight += h2hWeight
+  }
+
+  // Team draw rate signal (TIER 2, only if real)
+  if (teamDrawSignal !== null) {
+    const teamWeight = 0.10
+    weightedSum += teamDrawSignal * teamWeight
+    totalWeight += teamWeight
+  }
+
+  // Normalize to 0–1 (handles missing tier 2 signals cleanly)
+  const combinedSignal = totalWeight > 0 ? weightedSum / totalWeight : 0.5
+
+  // Convert to 0–10 draw score
+  const drawScore = Math.round(combinedSignal * 10 * 100) / 100
+
+  // ── Blended draw probability ──────────────────────────────────────────────────
+  // Use the market as anchor (it's the best single predictor),
+  // blend in Poisson, and add real signals when available
+  let blendedProb = 0.50 * impliedProb + 0.35 * poissonProb
+
+  const realSignalProbs: number[] = []
+  if (formSignal !== null) realSignalProbs.push(0.20 + formSignal * 0.25)
+  if (h2hSignal !== null) realSignalProbs.push(0.18 + h2hSignal * 0.30)
+  if (teamDrawSignal !== null) realSignalProbs.push(0.18 + teamDrawSignal * 0.25)
+
+  if (realSignalProbs.length > 0) {
+    const avgRealSignalProb = realSignalProbs.reduce((a, b) => a + b, 0) / realSignalProbs.length
+    blendedProb = blendedProb * 0.70 + avgRealSignalProb * 0.30
+  }
+
+  // Remaining weight (when tier 2 missing) goes to baseline league prior
+  if (realSignalProbs.length === 0) {
+    blendedProb = blendedProb * 0.85 + f.leagueAvgDrawRate * 0.15
+  }
 
   const probability = Math.min(0.95, Math.max(0.05, blendedProb))
   const edge = probability - impliedProb
 
-  // ── Confidence ────────────────────────────────────────────────────────────
-  // Pre-calibration: sigmoid over drawScore mapped to 15–85%.
-  // Post-calibration: blend 70% sigmoid + 30% Platt-adjusted probability.
-  const sigmoidRaw    = 1 / (1 + Math.exp(-(drawScore - 5) * 0.60))
-  const sigmoidPct    = 15 + sigmoidRaw * 70  // [15, 85]
+  // ── Confidence: quality-gated ─────────────────────────────────────────────────
+  //
+  // Key design: confidence range is CAPPED by data quality.
+  // With no real data:  confidence ∈ [20%, 50%]  — "I'm not sure"
+  // With some real data: confidence ∈ [20%, 65%]
+  // With good real data: confidence ∈ [20%, 80%]
+  //
+  // Within that range, the draw score determines where we land.
+  // This prevents the model from expressing 75% confidence
+  // when it's just reading league baselines.
+
+  const minConf = 20
+  const maxConf = Math.round(35 + dq.qualityScore * 45)  // 35–80% based on quality
 
   let confidence: number
   if (!isCalibrated()) {
-    confidence = Math.round(sigmoidPct)
+    // Pre-calibration: linear mapping of drawScore into quality-gated range
+    const scoreNorm = drawScore / 10
+    confidence = Math.round(minConf + scoreNorm * (maxConf - minConf))
   } else {
-    const plattPct = plattScale(probability) * 100
-    confidence = Math.round(0.70 * sigmoidPct + 0.30 * plattPct)
+    // Post-calibration: Platt scaling + quality gate
+    const plattConf = Math.round((1 / (1 + Math.exp(PLATT_A * probability + PLATT_B))) * 100)
+    const scoreNorm = drawScore / 10
+    const scoreConf = Math.round(minConf + scoreNorm * (maxConf - minConf))
+    // Blend Platt (70%) + score-based (30%)
+    confidence = Math.round(0.70 * plattConf + 0.30 * scoreConf)
   }
 
+  confidence = Math.min(maxConf, Math.max(minConf, confidence))
+
   return {
-    poissonProb,
+    poissonProb: Math.round(poissonProb * 1000) / 1000,
     probability: Math.round(probability * 1000) / 1000,
     drawScore,
-    confidence: Math.min(85, Math.max(15, confidence)),
+    confidence,
     edge: Math.round(edge * 1000) / 1000,
+    dataQuality: dq,
     breakdown: {
-      poissonScore:      Math.round(poissonScore * 100) / 100,
-      parityScore:       Math.round(parityScore * 100) / 100,
-      formScore:         Math.round(formScore * 100) / 100,
-      h2hScore:          Math.round(h2hScore * 100) / 100,
-      oddsScore:         Math.round(oddsScore * 100) / 100,
-      fatigueScore:      Math.round(fatigueScore * 100) / 100,
-      lineMovementScore: Math.round(lineMovementScore * 100) / 100,
-      leagueScore:       Math.round(leagueScore * 100) / 100,
+      marketSignal: Math.round(marketSignal * 100) / 100,
+      poissonSignal: Math.round(poissonSignal * 100) / 100,
+      formSignal: formSignal !== null ? Math.round(formSignal * 100) / 100 : null,
+      h2hSignal: h2hSignal !== null ? Math.round(h2hSignal * 100) / 100 : null,
+      teamDrawSignal: teamDrawSignal !== null ? Math.round(teamDrawSignal * 100) / 100 : null,
     },
   }
 }
@@ -408,14 +479,14 @@ export function fitPlattScaling(samples: CalibrationSample[]): { a: number; b: n
   }
 
   let a = -1.0, b = 0.0
-  const lr = 0.005          // Lower LR for better convergence
-  const epochs = 1000       // More epochs
+  const lr = 0.005
+  const epochs = 1000
   const n = samples.length
 
   for (let epoch = 0; epoch < epochs; epoch++) {
     let dA = 0, dB = 0
     for (const s of samples) {
-      const f = s.drawScore / 10   // Normalise input
+      const f = s.drawScore / 10
       const p = 1 / (1 + Math.exp(a * f + b))
       const y = s.wasCorrect ? 1 : 0
       const err = p - y
@@ -429,30 +500,33 @@ export function fitPlattScaling(samples: CalibrationSample[]): { a: number; b: n
   return { a: Math.round(a * 10000) / 10000, b: Math.round(b * 10000) / 10000 }
 }
 
-// ─── Form streak computation ──────────────────────────────────────────────────
+// ─── Form computation helpers ─────────────────────────────────────────────────
+
+export const FORM_WEIGHTS = [1.0, 0.9, 0.8, 0.7, 0.6]
 
 export interface FixtureResult {
   goalsScored: number
   isDraw: boolean
 }
 
-export function computeFormMetrics(
-  recentGames: FixtureResult[]
-): { formDrawRate: number; formGoalsAvg: number } {
+export function computeFormMetrics(recentGames: FixtureResult[]): {
+  formDrawRate: number
+  formGoalsAvg: number
+} {
   if (recentGames.length === 0) return { formDrawRate: 0.27, formGoalsAvg: 1.4 }
 
-  let weightedDraws = 0, weightedGoals = 0, totalWeight = 0
+  let wDraws = 0, wGoals = 0, totalW = 0
 
   recentGames.slice(0, 5).forEach((g, i) => {
-    const w = FORM_WEIGHTS[i]
-    weightedDraws += w * (g.isDraw ? 1 : 0)
-    weightedGoals += w * g.goalsScored
-    totalWeight += w
+    const w = FORM_WEIGHTS[i] ?? 0.6
+    wDraws += w * (g.isDraw ? 1 : 0)
+    wGoals += w * g.goalsScored
+    totalW += w
   })
 
   return {
-    formDrawRate: Math.round((weightedDraws / totalWeight) * 1000) / 1000,
-    formGoalsAvg: Math.round((weightedGoals / totalWeight) * 100) / 100,
+    formDrawRate: Math.round((wDraws / totalW) * 1000) / 1000,
+    formGoalsAvg: Math.round((wGoals / totalW) * 100) / 100,
   }
 }
 
@@ -474,30 +548,21 @@ export function computeH2HDrawRate(fixtures: H2HFixture[]): {
     .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
     .slice(0, 10)
 
-  let weightedDraws = 0, totalWeight = 0
+  let wDraws = 0, totalW = 0
   sorted.forEach((f, i) => {
     const w = i < 5 ? 2 : 1
-    const isDraw = f.homeGoals === f.awayGoals
-    weightedDraws += w * (isDraw ? 1 : 0)
-    totalWeight += w
+    wDraws += w * (f.homeGoals === f.awayGoals ? 1 : 0)
+    totalW += w
   })
 
   return {
-    drawRate: Math.round((weightedDraws / totalWeight) * 1000) / 1000,
+    drawRate: Math.round((wDraws / totalW) * 1000) / 1000,
     sampleSize: sorted.length,
   }
 }
 
-// ─── Line movement computation ────────────────────────────────────────────────
-
-export function computeOddsMovement(
-  openingOdds: number,
-  currentOdds: number
-): number {
-  return Math.round((currentOdds - openingOdds) * 100) / 100
-}
-
 // ─── Backward-compat shims ────────────────────────────────────────────────────
+// Keep existing callers working during migration
 
 export function calculateDrawScore(match: {
   home_goals_avg: number
@@ -511,27 +576,26 @@ export function calculateDrawScore(match: {
   leagues?: { avg_draw_rate?: number; draw_boost?: number } | null
 }): number {
   return predictDraw({
-    xgHome:            match.xg_home,
-    xgAway:            match.xg_away,
-    homeGoalsAvg:      match.home_goals_avg,
-    awayGoalsAvg:      match.away_goals_avg,
-    homeConcedeAvg:    match.home_goals_avg,
-    awayConcedeAvg:    match.away_goals_avg,
-    homeDrawRate:      match.home_draw_rate,
-    awayDrawRate:      match.away_draw_rate,
-    h2hDrawRate:       match.h2h_draw_rate,
-    h2hIsReal:         false,
-    drawOdds:          match.draw_odds,
-    homeOdds:          0,
-    awayOdds:          0,
+    xgHome: match.xg_home,
+    xgAway: match.xg_away,
+    homeGoalsAvg: match.home_goals_avg,
+    awayGoalsAvg: match.away_goals_avg,
+    homeConcedeAvg: match.home_goals_avg,
+    awayConcedeAvg: match.away_goals_avg,
+    homeDrawRate: match.home_draw_rate,
+    awayDrawRate: match.away_draw_rate,
+    h2hDrawRate: match.h2h_draw_rate,
+    h2hIsReal: false,
+    drawOdds: match.draw_odds,
     leagueAvgDrawRate: match.leagues?.avg_draw_rate ?? 0.27,
-    leagueDrawBoost:   match.leagues?.draw_boost ?? 0,
+    leagueDrawBoost: match.leagues?.draw_boost ?? 0,
+    hasRealTeamStats: false,
   }).drawScore
 }
 
 export function scoreToConfidence(score: number): number {
   const sigmoid = 1 / (1 + Math.exp(-(score - 5) * 0.60))
-  return Math.min(85, Math.max(15, Math.round(15 + sigmoid * 70)))
+  return Math.min(80, Math.max(20, Math.round(20 + sigmoid * 60)))
 }
 
 export function calculateDrawProbability(xgHome: number, xgAway: number): number {
