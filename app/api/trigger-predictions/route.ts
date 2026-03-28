@@ -170,7 +170,7 @@ async function upsertUpcomingMatches(apiKey: string): Promise<number> {
       const h2hResults = h2hStats?.isReal
         ? buildH2HFromStats(h2hStats, fixture.teams.home.id, fixture.teams.away.id)
         : undefined
-
+      
       return mapFixtureWithStats(
         fixture, drawOdds,
         statsMap.get(homeKey) ?? null,
@@ -312,42 +312,72 @@ async function runPipeline(): Promise<NextResponse> {
   console.log(`[pipeline] Scoring ${matches.length} matches…`)
 
   // ── Step 3: Score ──────────────────────────────────────────────────────────
-  const scored = matches.map(match => {
-    const features: DrawFeatures = {
-      xgHome:            match.xg_home           ?? 1.2,
-      xgAway:            match.xg_away           ?? 1.2,
-      homeGoalsAvg:      match.home_goals_avg     ?? 1.4,
-      awayGoalsAvg:      match.away_goals_avg     ?? 1.4,
-      homeConcedeAvg:    match.home_concede_avg   ?? 1.2,
-      awayConcedeAvg:    match.away_concede_avg   ?? 1.2,
-      homeDrawRate:      match.home_draw_rate     ?? 0.27,
-      awayDrawRate:      match.away_draw_rate     ?? 0.27,
-      h2hDrawRate:       match.h2h_draw_rate      ?? 0.27,
-      h2hIsReal:         match.h2h_is_real        ?? false,
-      drawOdds:          match.draw_odds          ?? 3.2,
-      homeOdds: 0, awayOdds: 0,
-      xgIsReal:          (match.xg_home ?? 0) > 0,   // set true if xG was scraped
-      hasRealTeamStats:  match.has_real_team_stats ?? false,  // already in DB
-      oddsMovement:      match.odds_movement      ?? undefined,
-      oddsOpenDraw:      match.odds_open          ?? undefined,
-      homeFormDrawRate:  match.home_form_draw_rate ?? undefined,
-      awayFormDrawRate:  match.away_form_draw_rate ?? undefined,
-      homeFormGoalsAvg:  match.home_form_goals_avg ?? undefined,
-      awayFormGoalsAvg:  match.away_form_goals_avg ?? undefined,
-      homeGamesLast14:   match.home_games_last14  ?? undefined,
-      awayGamesLast14:   match.away_games_last14  ?? undefined,
-      leagueAvgDrawRate: match.leagues?.avg_draw_rate ?? 0.27,
-      leagueDrawBoost:   match.leagues?.draw_boost    ?? 0,
-    }
-    return { ...match, ...predictDraw(features) }
-  })
+ const scored = matches.map((match: any) => {
+  const features = {
+         // ── xG ───────────────────────────────────────────────────────────────────
+    xgHome:  match.xg_home  ?? 1.2,
+    xgAway:  match.xg_away  ?? 1.2,
+    // xgIsReal: true only if xG came from Understat/FBref scraper.
+    // We detect this by checking if xg_home was non-zero AND has_real_team_stats
+    // (scraper updates xg_home directly on the match row).
+    // If you add a dedicated `xg_is_real` boolean column later, use that instead.
+    xgIsReal: (match.xg_home ?? 0) > 0 && (match.has_real_team_stats === true),
+ 
+    // ── Goal averages ─────────────────────────────────────────────────────────
+    homeGoalsAvg:   match.home_goals_avg   ?? 1.4,
+    awayGoalsAvg:   match.away_goals_avg   ?? 1.4,
+    homeConcedeAvg: match.home_concede_avg ?? 1.2,
+    awayConcedeAvg: match.away_concede_avg ?? 1.2,
+ 
+    // ── Draw rates ────────────────────────────────────────────────────────────
+    homeDrawRate: match.home_draw_rate ?? 0.27,
+    awayDrawRate: match.away_draw_rate ?? 0.27,
+    h2hDrawRate:  match.h2h_draw_rate  ?? 0.27,
+    h2hIsReal:    match.h2h_is_real    ?? false,
+ 
+    // ── Odds ──────────────────────────────────────────────────────────────────
+    drawOdds:      match.draw_odds ?? 3.2,
+    homeOdds:      0,
+    awayOdds:      0,
+    oddsMovement:  match.odds_movement ?? undefined,
+    oddsOpenDraw:  match.odds_open     ?? undefined,
+ 
+    // ── Under 2.5 odds — THE KEY NEW SIGNAL ──────────────────────────────────
+    // Pass undefined if not available (not null — undefined triggers the
+    // "no under25 data" path cleanly)
+    under25Odds: (match.under25_odds && match.under25_odds > 0)
+      ? match.under25_odds
+      : undefined,
+ 
+    // ── Data quality flags ────────────────────────────────────────────────────
+    hasRealTeamStats: match.has_real_team_stats ?? false,
+ 
+    // ── Form (pass as undefined when null so Tier 2 gates work correctly) ────
+    homeFormDrawRate: match.home_form_draw_rate ?? undefined,
+    awayFormDrawRate: match.away_form_draw_rate ?? undefined,
+    homeFormGoalsAvg: match.home_form_goals_avg ?? undefined,
+    awayFormGoalsAvg: match.away_form_goals_avg ?? undefined,
+    homeGamesLast14:  match.home_games_last14   ?? undefined,
+    awayGamesLast14:  match.away_games_last14   ?? undefined,
+ 
+    // ── League ────────────────────────────────────────────────────────────────
+    leagueAvgDrawRate: match.leagues?.avg_draw_rate ?? 0.27,
+    leagueDrawBoost:   match.leagues?.draw_boost    ?? 0,
+  }
+ 
+  const result = predictDraw(features)
+ 
+  return { ...match, ...result }
+})
 
   // ── Step 4: Write scores back ──────────────────────────────────────────────
-  await Promise.all(scored.map(m =>
-    supabaseAdmin.from('matches').update({
-      draw_score: m.drawScore, draw_probability: m.probability, confidence: m.confidence,
-    }).eq('id', m.id)
-  ))
+  await Promise.all(scored.map((m: any) =>
+  supabaseAdmin.from('matches').update({
+    draw_score:       m.drawScore,
+    draw_probability: m.probability,
+    confidence:       m.confidence,
+  }).eq('id', m.id)
+))
   console.log(`[pipeline] Scores written for ${scored.length} matches`)
 
   // ── Step 5: Rebuild predictions ────────────────────────────────────────────

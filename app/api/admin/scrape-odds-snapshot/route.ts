@@ -59,7 +59,7 @@ async function runOddsSnapshot(): Promise<NextResponse> {
       const url = new URL(`${BASE_URL}/sports/${sportKey}/odds`)
       url.searchParams.set('apiKey', apiKey)
       url.searchParams.set('regions', 'eu,uk')
-      url.searchParams.set('markets', 'h2h')
+      url.searchParams.set('markets', 'h2h, totals')
       url.searchParams.set('oddsFormat', 'decimal')
       url.searchParams.set('bookmakers', BOOKMAKERS)
 
@@ -92,53 +92,61 @@ async function runOddsSnapshot(): Promise<NextResponse> {
         let bestHome: number | null = null
         let bestAway: number | null = null
 
+
+        let bestUnder25: number | null = null
         for (const bm of event.bookmakers ?? []) {
-          const h2h = bm.markets?.find((m: any) => m.key === 'h2h')
-          if (!h2h) continue
-
-          const home = h2h.outcomes.find((o: any) => o.name === event.home_team)?.price
-          const away = h2h.outcomes.find((o: any) => o.name === event.away_team)?.price
-          const draw = h2h.outcomes.find((o: any) => o.name === 'Draw')?.price
-
-          if (draw) {
-            snapshots.push({
-              match_external_id: event.id,
-              bookmaker: bm.key,
-              home_odds: home ?? null,
-              draw_odds: draw,
-              away_odds: away ?? null,
-              snapshotted_at: now,
-            })
-            if (!bestDraw || draw > bestDraw) {
-              bestDraw = draw; bestHome = home; bestAway = away
-            }
-          }
-        }
+  const h2h    = bm.markets?.find((m: any) => m.key === 'h2h')
+  const totals = bm.markets?.find((m: any) => m.key === 'totals')
+ 
+  if (!h2h && !totals) continue
+ 
+  // Draw odds from h2h market
+  const home = h2h?.outcomes.find((o: any) => o.name === event.home_team)?.price
+  const away = h2h?.outcomes.find((o: any) => o.name === event.away_team)?.price
+  const draw = h2h?.outcomes.find((o: any) => o.name === 'Draw')?.price
+ 
+  // Under 2.5 from totals market
+  const under25 = totals?.outcomes?.find(
+    (o: any) => o.name === 'Under' && (o.point === 2.5 || o.point === '2.5')
+  )?.price
+ 
+  if (draw) {
+    snapshots.push({
+      match_external_id: event.id,
+      bookmaker: bm.key,
+      home_odds: home ?? null,
+      draw_odds: draw,
+      away_odds: away ?? null,
+      under25_odds: under25 ?? null,   // NEW
+      snapshotted_at: now,
+    })
+    if (!bestDraw || draw > bestDraw) {
+      bestDraw = draw
+      bestHome = home
+      bestAway = away
+    }
+  }
+ 
+  // Track best (lowest = most confident) Under 2.5 price
+  if (under25 && (!bestUnder25 || under25 < bestUnder25)) {
+    bestUnder25 = under25
+  }
+}
 
         // Upsert the match with updated odds + movement tracking
         if (match && bestDraw) {
-          const oddsOpen = match.odds_open ?? bestDraw
-          const movement = oddsOpen
-            ? parseFloat(((bestDraw - oddsOpen) / oddsOpen * 100).toFixed(2))
-            : null
-
-          await supabaseAdmin.from('matches').update({
-            draw_odds: bestDraw,
-            odds_open: match.odds_open ?? bestDraw,
-            odds_movement: movement,
-          }).eq('id', match.id)
-        } else if (!match && bestDraw) {
-          // Stub entry for tracking
-          await supabaseAdmin.from('matches').upsert({
-            external_id: event.id,
-            home_team_name: event.home_team,
-            away_team_name: event.away_team,
-            match_date: new Date(event.commence_time).toISOString(),
-            draw_odds: bestDraw,
-            odds_open: bestDraw,
-            status: 'scheduled',
-          }, { onConflict: 'external_id', ignoreDuplicates: false })
-        }
+  const oddsOpen   = match.odds_open ?? bestDraw
+  const movement   = oddsOpen
+    ? parseFloat(((bestDraw - oddsOpen) / oddsOpen * 100).toFixed(2))
+    : null
+ 
+  await supabaseAdmin.from('matches').update({
+    draw_odds:    bestDraw,
+    odds_open:    match.odds_open ?? bestDraw,
+    odds_movement: movement,
+    under25_odds: bestUnder25 ?? null,   // NEW — stores the sharpest price
+  }).eq('id', match.id)
+}
 
         // Bulk insert snapshots
         if (snapshots.length) {

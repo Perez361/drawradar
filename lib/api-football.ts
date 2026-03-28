@@ -562,6 +562,29 @@ export async function fetchUpcomingFixtures(
 
 // ─── Odds extraction ──────────────────────────────────────────────────────────
 
+export interface FixtureOdds {
+  drawOdds: number
+  under25Odds: number   // 0 if not available
+}
+ 
+export async function fetchOddsForFixtures(
+  apiKey: string,
+  fixtureIds: number[]
+): Promise<Map<number, FixtureOdds>> {
+  const oddsMap = new Map<number, FixtureOdds>()
+  for (const fixtureId of fixtureIds) {
+    const odds = await fetchOddsForFixture(apiKey, fixtureId)
+    oddsMap.set(fixtureId, odds)
+  }
+  return oddsMap
+}
+ 
+// Preferred bookmakers for Under 2.5 — same list as draw odds
+const PRIORITY_BOOKS: readonly string[] = [
+  '1xbet', 'betway', 'pinnacle', 'bet365', 'williamhill', 'william hill', 'bwin', 'unibet',
+  'betfair exchange', 'betfair', 'marathonbet', 'betsson', 'nordicbet', 'parimatch',
+]
+ 
 function extractDrawOddsFromBookmaker(
   bm: ApiFootballOdds['bookmakers'][0]
 ): number {
@@ -570,77 +593,125 @@ function extractDrawOddsFromBookmaker(
   const drawVal = bet.values.find((v) => v.value === 'Draw' || v.value === 'X')
   return drawVal ? parseFloat(drawVal.odd) : 0
 }
-
-const PRIORITY_BOOKS: readonly string[] = [
-  '1xbet', 'betway', 'pinnacle', 'bet365', 'williamhill', 'william hill', 'bwin', 'unibet',
-  'betfair exchange', 'betfair', 'marathonbet', 'betsson',
-  'nordicbet', 'parimatch',
-]
-
-export async function fetchOddsForFixtures(
-  apiKey: string,
-  fixtureIds: number[]
-): Promise<Map<number, number>> {
-  const oddsMap = new Map<number, number>()
-  for (const fixtureId of fixtureIds) {
-    const odds = await fetchOddsForFixture(apiKey, fixtureId)
-    oddsMap.set(fixtureId, odds)
-  }
-  return oddsMap
+ 
+function extractUnder25OddsFromBookmaker(
+  bm: ApiFootballOdds['bookmakers'][0]
+): number {
+  // API-Football: bet id=5 is "Goals Over/Under", values like "Over 2.5" / "Under 2.5"
+  const bet = bm.bets.find(
+    (b) => b.id === 5 ||
+           b.name === 'Goals Over/Under' ||
+           b.name === 'Over/Under'
+  )
+  if (!bet) return 0
+  const under25 = bet.values.find(
+    (v) => v.value === 'Under 2.5' || v.value === 'Under2.5' || v.value === 'u2.5'
+  )
+  return under25 ? parseFloat(under25.odd) : 0
 }
-
+ 
 export async function fetchOddsForFixture(
   apiKey: string,
   fixtureId: number
-): Promise<number> {
+): Promise<FixtureOdds> {
+  // Fetch both markets in parallel (uses 1 rate-limit slot each but saves wall time)
+  // Note: API-Football free plan only allows 1 bet per request, so we fetch sequentially.
+  // If you're on a paid plan, add &bet=1,5 to get both in one call.
+ 
+  let drawOdds = 0
+  let under25Odds = 0
+ 
   try {
-    const data = await apiFetch<ApiFootballOdds[]>(apiKey, `/odds?fixture=${fixtureId}&bet=1`)
-    if (!data) return 0
-
-    const bookmakers = data[0]?.bookmakers ?? []
-    if (!bookmakers.length) {
-      console.log(`[odds] fixture ${fixtureId} — no bookmakers returned`)
-      return 0
-    }
-
-    for (const preferred of PRIORITY_BOOKS) {
-      for (const bm of bookmakers) {
-        if (bm.name.toLowerCase().includes(preferred)) {
-          const odds = extractDrawOddsFromBookmaker(bm)
-          if (odds > 0) {
-            console.log(`[odds] fixture ${fixtureId} — using ${bm.name}: ${odds}`)
-            return odds
+    // ── Draw odds (bet id=1) ──────────────────────────────────────────────
+    const drawData = await apiFetch<ApiFootballOdds[]>(
+      apiKey, `/odds?fixture=${fixtureId}&bet=1`
+    )
+    if (drawData) {
+      const bookmakers = drawData[0]?.bookmakers ?? []
+ 
+      // Try priority bookmakers first
+      for (const preferred of PRIORITY_BOOKS) {
+        for (const bm of bookmakers) {
+          if (bm.name.toLowerCase().includes(preferred)) {
+            const o = extractDrawOddsFromBookmaker(bm)
+            if (o > 0) { drawOdds = o; break }
           }
         }
+        if (drawOdds > 0) break
       }
+ 
+      // Fallback: trimmed median
+      if (drawOdds === 0) {
+        const allOdds = bookmakers
+          .map((bm) => extractDrawOddsFromBookmaker(bm))
+          .filter((o) => o >= 1.20 && o <= 20.0)
+          .sort((a, b) => a - b)
+ 
+        if (allOdds.length > 0) {
+          const trimCount = Math.floor(allOdds.length * 0.15)
+          const trimmed   = allOdds.slice(trimCount, allOdds.length - trimCount)
+          const src       = trimmed.length > 0 ? trimmed : allOdds
+          const mid       = Math.floor(src.length / 2)
+          drawOdds = src.length % 2 !== 0
+            ? src[mid]
+            : (src[mid - 1] + src[mid]) / 2
+          drawOdds = Math.round(drawOdds * 100) / 100
+        }
+      }
+ 
+      console.log(`[odds] fixture ${fixtureId} — draw: ${drawOdds}`)
     }
-
-    const allOdds = bookmakers
-      .map((bm) => extractDrawOddsFromBookmaker(bm))
-      .filter((o) => o >= 1.20 && o <= 20.0)
-      .sort((a, b) => a - b)
-
-    if (!allOdds.length) {
-      console.log(`[odds] fixture ${fixtureId} — all bookmakers had no draw market`)
-      return 0
+ 
+    // ── Under 2.5 odds (bet id=5) ─────────────────────────────────────────
+    // Costs 1 extra API request. On free plan (100/day) this doubles your odds
+    // usage. Recommendation: only fetch u25 for the top-ranked candidates after
+    // the first pass, or use The Odds API snapshot (already in your cron) which
+    // includes totals for free.
+    const totalsData = await apiFetch<ApiFootballOdds[]>(
+      apiKey, `/odds?fixture=${fixtureId}&bet=5`
+    )
+    if (totalsData) {
+      const bookmakers = totalsData[0]?.bookmakers ?? []
+ 
+      // Try priority bookmakers first
+      for (const preferred of PRIORITY_BOOKS) {
+        for (const bm of bookmakers) {
+          if (bm.name.toLowerCase().includes(preferred)) {
+            const o = extractUnder25OddsFromBookmaker(bm)
+            if (o > 0) { under25Odds = o; break }
+          }
+        }
+        if (under25Odds > 0) break
+      }
+ 
+      // Fallback: trimmed median
+      if (under25Odds === 0) {
+        const allU25 = bookmakers
+          .map((bm) => extractUnder25OddsFromBookmaker(bm))
+          .filter((o) => o >= 1.05 && o <= 5.0)
+          .sort((a, b) => a - b)
+ 
+        if (allU25.length > 0) {
+          const trimCount = Math.floor(allU25.length * 0.15)
+          const trimmed   = allU25.slice(trimCount, allU25.length - trimCount)
+          const src       = trimmed.length > 0 ? trimmed : allU25
+          const mid       = Math.floor(src.length / 2)
+          under25Odds = src.length % 2 !== 0
+            ? src[mid]
+            : (src[mid - 1] + src[mid]) / 2
+          under25Odds = Math.round(under25Odds * 100) / 100
+        }
+      }
+ 
+      console.log(`[odds] fixture ${fixtureId} — under 2.5: ${under25Odds}`)
     }
-
-    const trimCount = Math.floor(allOdds.length * 0.15)
-    const trimmed   = allOdds.slice(trimCount, allOdds.length - trimCount)
-    const src       = trimmed.length > 0 ? trimmed : allOdds
-    const mid       = Math.floor(src.length / 2)
-    const median    = src.length % 2 !== 0
-      ? src[mid]
-      : (src[mid - 1] + src[mid]) / 2
-
-    console.log(`[odds] fixture ${fixtureId} — clipped median (${src.length} books): ${median}`)
-    return Math.round(median * 100) / 100
+ 
   } catch (err) {
     console.warn(`[odds] fixture ${fixtureId} fetch failed:`, err)
-    return 0
   }
+ 
+  return { drawOdds, under25Odds }
 }
-
 // ─── H2H ─────────────────────────────────────────────────────────────────────
 
 export async function fetchH2H(
