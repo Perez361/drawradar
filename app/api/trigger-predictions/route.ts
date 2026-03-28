@@ -119,13 +119,15 @@ async function upsertUpcomingMatches(apiKey: string): Promise<number> {
 
   
   const fixturesWithOdds = toProcess
-    .map(fixture => {
-      const extId = `apifb_${fixture.fixture.id}`
-      const drawOdds = oddsMap.get(fixture.fixture.id) ?? 0
-      const openingOdds = existingOpenOdds.get(extId) ?? (drawOdds > 0 ? drawOdds : null)
-      return { fixture, drawOdds, openingOdds }
-    })
-    .filter(({ drawOdds }) => drawOdds > 0)
+  .map(fixture => {
+    const extId = `apifb_${fixture.fixture.id}`
+    const oddsResult = oddsMap.get(fixture.fixture.id)
+    const drawOdds = oddsResult?.drawOdds ?? 0
+    const under25Odds = oddsResult?.under25Odds ?? 0
+    const openingOdds = existingOpenOdds.get(extId) ?? (drawOdds > 0 ? drawOdds : null)
+    return { fixture, drawOdds, under25Odds, openingOdds }
+  })
+  .filter(({ drawOdds }) => drawOdds > 0)
 
   console.log(`[pipeline] Fixtures with valid odds: ${fixturesWithOdds.length} / ${toProcess.length}`)
 
