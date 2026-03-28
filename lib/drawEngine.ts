@@ -115,33 +115,26 @@ function isCalibrated(): boolean {
 
 // ─── Poisson ──────────────────────────────────────────────────────────────────
 
-function factorial(n: number): number {
-  if (n <= 1) return 1
-  if (n > 20) {
-    let logFact = 0
-    for (let i = 2; i <= n; i++) logFact += Math.log(i)
-    return Math.exp(logFact)
-  }
-  let r = 1
-  for (let i = 2; i <= n; i++) r *= i
+function logFactorial(n: number): number {
+  if (n <= 1) return 0
+  let r = 0
+  for (let i = 2; i <= n; i++) r += Math.log(i)
   return r
 }
 
 function poisson(lambda: number, k: number): number {
   if (lambda <= 0) return k === 0 ? 1 : 0
-  return (Math.pow(lambda, k) * Math.exp(-lambda)) / factorial(k)
+  return Math.exp(k * Math.log(lambda) - lambda - logFactorial(k))
 }
 
 export function poissonDrawProbability(xgHome: number, xgAway: number): number {
-  const maxLambda = Math.max(xgHome, xgAway)
-  const maxGoals = Math.max(8, Math.ceil(maxLambda + 4 * Math.sqrt(maxLambda) + 2))
+  const maxGoals = Math.min(12, Math.ceil(Math.max(xgHome, xgAway) * 3 + 4))
   let prob = 0
   for (let k = 0; k <= maxGoals; k++) {
     prob += poisson(xgHome, k) * poisson(xgAway, k)
   }
   return Math.min(prob, 0.99)
 }
-
 // ─── Signal: Market (TIER 1 — always real) ────────────────────────────────────
 //
 // The market is the single most reliable draw signal we have.
@@ -158,28 +151,23 @@ export function poissonDrawProbability(xgHome: number, xgAway: number): number {
 //   odds shortened → sharp money backing draw
 //   odds drifted  → sharp money fading draw
 
-function computeMarketSignal(
-  drawOdds: number,
-  oddsMovement?: number
-): { signal: number; impliedProb: number } {
+function computeMarketSignal(drawOdds: number, oddsMovement?: number) {
   const impliedProb = 1 / drawOdds
 
-  // Base signal from odds zone (0–1 scale)
   let baseSignal: number
-  if (drawOdds >= 3.05 && drawOdds <= 3.45)      baseSignal = 0.85  // prime zone
-  else if (drawOdds >= 2.85 && drawOdds < 3.05)   baseSignal = 0.70  // slightly short
-  else if (drawOdds > 3.45 && drawOdds <= 3.75)   baseSignal = 0.60  // slight drift
-  else if (drawOdds >= 2.65 && drawOdds < 2.85)   baseSignal = 0.45  // overpriced by market
-  else if (drawOdds > 3.75 && drawOdds <= 4.10)   baseSignal = 0.35  // long shot
-  else                                              baseSignal = 0.10  // outside useful range
+  if (drawOdds >= 3.20 && drawOdds <= 3.60)      baseSignal = 0.85  // prime zone
+  else if (drawOdds >= 2.95 && drawOdds < 3.20)   baseSignal = 0.70
+  else if (drawOdds > 3.60 && drawOdds <= 3.90)   baseSignal = 0.60
+  else if (drawOdds >= 2.70 && drawOdds < 2.95)   baseSignal = 0.40  // market disfavors draw
+  else if (drawOdds > 3.90 && drawOdds <= 4.20)   baseSignal = 0.30
+  else                                              baseSignal = 0.10
 
-  // Line movement modifier
   let movementMod = 0
   if (oddsMovement !== undefined && oddsMovement !== null) {
-    if (oddsMovement < -0.20) movementMod = +0.12  // sharp steam toward draw
-    else if (oddsMovement < -0.08) movementMod = +0.06
-    else if (oddsMovement > 0.30)  movementMod = -0.15  // strong fade
-    else if (oddsMovement > 0.12)  movementMod = -0.08
+    if (oddsMovement < -0.25)      movementMod = +0.10  // steam toward draw
+    else if (oddsMovement < -0.10) movementMod = +0.05
+    else if (oddsMovement > 0.35)  movementMod = -0.12  // sharp money fading
+    else if (oddsMovement > 0.15)  movementMod = -0.06
   }
 
   return {
@@ -398,26 +386,29 @@ export function predictDraw(f: DrawFeatures): DrawPrediction {
   // ── Blended draw probability ──────────────────────────────────────────────────
   // Use the market as anchor (it's the best single predictor),
   // blend in Poisson, and add real signals when available
-  let blendedProb = 0.50 * impliedProb + 0.35 * poissonProb
+  // Market is the anchor, blended with Poisson
+let blendedProb = 0.45 * impliedProb + 0.40 * poissonProb + 0.15 * f.leagueAvgDrawRate
 
-  const realSignalProbs: number[] = []
-  if (formSignal !== null) realSignalProbs.push(0.20 + formSignal * 0.25)
-  if (h2hSignal !== null) realSignalProbs.push(0.18 + h2hSignal * 0.30)
-  if (teamDrawSignal !== null) realSignalProbs.push(0.18 + teamDrawSignal * 0.25)
+// Only adjust if we have real Tier 2 signals
+const realSignalProbs: number[] = []
+if (formSignal !== null) {
+  realSignalProbs.push(0.18 + formSignal * 0.28)
+}
+if (h2hSignal !== null) {
+  realSignalProbs.push(0.18 + h2hSignal * 0.32)
+}
+if (teamDrawSignal !== null) {
+  realSignalProbs.push(0.18 + teamDrawSignal * 0.28)
+}
 
-  if (realSignalProbs.length > 0) {
-    const avgRealSignalProb = realSignalProbs.reduce((a, b) => a + b, 0) / realSignalProbs.length
-    blendedProb = blendedProb * 0.70 + avgRealSignalProb * 0.30
-  }
+if (realSignalProbs.length > 0) {
+  const avgReal = realSignalProbs.reduce((a, b) => a + b) / realSignalProbs.length
+  // Blend: Tier 1 anchor stays dominant
+  blendedProb = blendedProb * 0.75 + avgReal * 0.25
+}
 
-  // Remaining weight (when tier 2 missing) goes to baseline league prior
-  if (realSignalProbs.length === 0) {
-    blendedProb = blendedProb * 0.85 + f.leagueAvgDrawRate * 0.15
-  }
-
-  const probability = Math.min(0.95, Math.max(0.05, blendedProb))
-  const edge = probability - impliedProb
-
+const probability = Math.min(0.95, Math.max(0.10, blendedProb))
+const edge = probability - impliedProb  // both are 0–1 floats — correct
   // ── Confidence: quality-gated ─────────────────────────────────────────────────
   //
   // Key design: confidence range is CAPPED by data quality.
@@ -429,25 +420,23 @@ export function predictDraw(f: DrawFeatures): DrawPrediction {
   // This prevents the model from expressing 75% confidence
   // when it's just reading league baselines.
 
-  const minConf = 20
-  const maxConf = Math.round(35 + dq.qualityScore * 45)  // 35–80% based on quality
+ // Market always earns some confidence on its own
+const marketConfBonus = marketSignal >= 0.70 ? 15 : marketSignal >= 0.45 ? 8 : 0
+const maxConf = Math.round(40 + dq.qualityScore * 40 + marketConfBonus)  // 40–95
+const minConf = 22
 
-  let confidence: number
-  if (!isCalibrated()) {
-    // Pre-calibration: linear mapping of drawScore into quality-gated range
-    const scoreNorm = drawScore / 10
-    confidence = Math.round(minConf + scoreNorm * (maxConf - minConf))
-  } else {
-    // Post-calibration: Platt scaling + quality gate
-    const plattConf = Math.round((1 / (1 + Math.exp(PLATT_A * probability + PLATT_B))) * 100)
-    const scoreNorm = drawScore / 10
-    const scoreConf = Math.round(minConf + scoreNorm * (maxConf - minConf))
-    // Blend Platt (70%) + score-based (30%)
-    confidence = Math.round(0.70 * plattConf + 0.30 * scoreConf)
-  }
+let confidence: number;
 
-  confidence = Math.min(maxConf, Math.max(minConf, confidence))
-
+if (!isCalibrated()) {
+  const scoreNorm = drawScore / 10
+  confidence = Math.round(minConf + scoreNorm * (maxConf - minConf))
+} else {
+  const plattConf = Math.round((1 / (1 + Math.exp(PLATT_A * probability + PLATT_B))) * 100)
+  const scoreNorm = drawScore / 10
+  const scoreConf = Math.round(minConf + scoreNorm * (maxConf - minConf))
+  confidence = Math.round(0.65 * plattConf + 0.35 * scoreConf)
+}
+confidence = Math.min(maxConf, Math.max(minConf, confidence))
   return {
     poissonProb: Math.round(poissonProb * 1000) / 1000,
     probability: Math.round(probability * 1000) / 1000,

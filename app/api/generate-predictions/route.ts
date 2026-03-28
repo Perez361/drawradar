@@ -51,11 +51,11 @@ export async function GET() {
 
     // 4. FILTER (CRITICAL)
     if (
-      result.probability >= 0.30 &&
-      result.edge > 0.03 &&
-      match.draw_odds >= 2.6 &&
-      match.draw_odds <= 3.8
-    ) {
+  result.probability >= 0.28 &&
+  result.edge > 0.02 &&
+  match.draw_odds >= 2.80 &&   // was 2.60 — too low, bookmakers rarely misprice that far
+  match.draw_odds <= 4.00      // was 3.80 — extend slightly for value bets
+) {
       await supabase.from('predictions').insert({
         match_id:        match.id,
         confidence:      result.confidence,

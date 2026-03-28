@@ -13,7 +13,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 import {
-  fetchFixturesForDate,
+  fetchUpcomingFixtures,
   fetchOddsForFixtures,
   mapFixtureWithStats,
   LEAGUE_ID_TO_INFO,
@@ -43,7 +43,7 @@ import {
 //   2N form stats
 //   N  H2H
 // With N=8: 1 + 8 + 16 + 16 + 8 = 49 requests. Safe for one daily run.
-const MAX_FIXTURES_TO_PROCESS = 8
+const MAX_FIXTURES_TO_PROCESS = 12
 
 // ─── League upsert ────────────────────────────────────────────────────────────
 
@@ -72,10 +72,10 @@ async function upsertLeague(name: string, country: string, avgDrawRate: number):
 // Returns -1 if API gave 0 fixtures (hard stop), 0 if no tracked+odds fixtures,
 // or the count of matches upserted.
 
-async function upsertTodayMatches(today: string, apiKey: string): Promise<number> {
-  console.log(`[pipeline] Fetching fixtures for ${today}…`)
-  const allFixtures = await fetchFixturesForDate(apiKey, today)
-  console.log(`[pipeline] Total fixtures from API: ${allFixtures.length}`)
+async function upsertUpcomingMatches(apiKey: string): Promise<number> {
+  console.log(`[pipeline] Fetching upcoming fixtures…`)
+  const allFixtures = await fetchUpcomingFixtures(apiKey, 7, MAX_FIXTURES_TO_PROCESS * 2)
+  console.log(`[pipeline] Total upcoming tracked NS fixtures: ${allFixtures.length}`)
 
   if (allFixtures.length === 0) {
     console.warn(`[pipeline] API returned 0 fixtures — check quota/key/schedule.`)
@@ -280,33 +280,28 @@ async function runPipeline(): Promise<NextResponse> {
   // ── Step 1: Fetch & upsert fixtures+odds ───────────────────────────────────
   let fetched: number
   try {
-    fetched = await upsertTodayMatches(today, apiKey)
+    fetched = await upsertUpcomingMatches(apiKey)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('[pipeline] Fetch/upsert failed:', msg)
     return NextResponse.json({ error: `Fixture fetch failed: ${msg}` }, { status: 500 })
   }
 
-  if (fetched === -1) {
-    return NextResponse.json({
-      error: `API-Football returned 0 fixtures for ${today}.`,
-      hint: 'Check API_FOOTBALL_KEY, quota at dashboard.api-football.com, and match schedule.',
-    }, { status: 502 })
-  }
-
   if (fetched === 0) {
     return NextResponse.json({
       success: true, fetched: 0, predictions: 0, top_pick: null,
-      message: `No tracked fixtures with odds for ${today}.`,
+      message: `No tracked upcoming fixtures with odds.`,
     })
   }
 
   // ── Step 2: Read fresh matches from DB ─────────────────────────────────────
+  const endOfWeek = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
+  const weekEndStr = endOfWeek.toISOString().split('T')[0] + 'T23:59:59'
   const { data: matches, error: matchErr } = await supabaseAdmin
     .from('matches')
     .select('*, leagues(name, country, avg_draw_rate, draw_boost)')
-    .gte('match_date', `${today}T00:00:00`)
-    .lte('match_date', `${today}T23:59:59`)
+    .gte('match_date', `${today}T00:00:00Z`)
+    .lte('match_date', weekEndStr)
 
   if (matchErr || !matches || matches.length === 0) {
     const msg = matchErr?.message ?? `No matches in DB for ${today} after upsert.`
@@ -331,6 +326,8 @@ async function runPipeline(): Promise<NextResponse> {
       h2hIsReal:         match.h2h_is_real        ?? false,
       drawOdds:          match.draw_odds          ?? 3.2,
       homeOdds: 0, awayOdds: 0,
+      xgIsReal:          (match.xg_home ?? 0) > 0,   // set true if xG was scraped
+      hasRealTeamStats:  match.has_real_team_stats ?? false,  // already in DB
       oddsMovement:      match.odds_movement      ?? undefined,
       oddsOpenDraw:      match.odds_open          ?? undefined,
       homeFormDrawRate:  match.home_form_draw_rate ?? undefined,

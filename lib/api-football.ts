@@ -11,7 +11,7 @@
 //   3. fetchRecentFixtures now tries currentYear first, falls back to
 //      currentYear-1 automatically, fixing leagues on split-year calendars
 //      (Thai League, some African leagues, etc.) that returned 0 results.
-//   4. Fetches last=10 fixtures instead of full season — cheaper on quota.
+//   4. Fetches full season FT fixtures (free plan compatible), sorts/slices top 10 recent — quota safe.
 
 export const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io'
 
@@ -506,6 +506,60 @@ export async function fetchFixturesForDate(
   return data ?? []
 }
 
+// ─── Fetch upcoming NS fixtures over next N days (NEW) ─────────────────────────
+
+/**
+ * Fetches scheduled (NS) fixtures over next `days` days.
+ * - Filters status.short === 'NS' only.
+ * - Dedupes by league/team to respect budget.
+ * - Stops early if too many tracked found.
+ */
+export async function fetchUpcomingFixtures(
+  apiKey: string,
+  days: number = 3,
+  maxTracked: number = 20
+): Promise<ApiFootballFixture[]> {
+  const allUpcoming: ApiFootballFixture[] = []
+  const seenLeagues = new Set<number>()
+  const seenTeams = new Set<string>()  // 'leagueId:teamId'
+  let trackedCount = 0
+
+  const now = new Date()
+  for (let i = 0; i <= days; i++) {
+    const dateStr = new Date(now.getTime() + i * 24 * 60 * 60 * 1000)
+      .toISOString().split('T')[0]
+    
+    console.log(`[upcoming] Scanning ${dateStr}…`)
+    const fixtures = await fetchFixturesForDate(apiKey, dateStr)
+    
+    for (const f of fixtures) {
+      if (f.fixture.status.short !== 'NS') continue  // Only Not Started
+
+      const leagueId = f.league.id
+      if (!LEAGUE_ID_TO_INFO[leagueId]) continue  // Tracked only
+
+      const teamKeyHome = `${leagueId}:${f.teams.home.id}`
+      const teamKeyAway = `${leagueId}:${f.teams.away.id}`
+      
+      if (seenTeams.has(teamKeyHome) || seenTeams.has(teamKeyAway)) continue
+      if (seenLeagues.has(leagueId) && allUpcoming.length >= maxTracked) break
+
+      seenTeams.add(teamKeyHome)
+      seenTeams.add(teamKeyAway)
+      seenLeagues.add(leagueId)
+      allUpcoming.push(f)
+      trackedCount++
+
+      if (trackedCount >= maxTracked) break
+    }
+
+    if (trackedCount >= maxTracked) break
+  }
+
+  console.log(`[upcoming] Found ${allUpcoming.length} unique tracked NS fixtures over ${days} days`)
+  return allUpcoming
+}
+
 // ─── Odds extraction ──────────────────────────────────────────────────────────
 
 function extractDrawOddsFromBookmaker(
@@ -518,9 +572,9 @@ function extractDrawOddsFromBookmaker(
 }
 
 const PRIORITY_BOOKS: readonly string[] = [
-  'pinnacle', 'bet365', 'williamhill', 'william hill', 'bwin', 'unibet',
-  'betfair exchange', 'betfair', 'marathonbet', 'betsson', '1xbet',
-  'nordicbet', 'betway', 'parimatch',
+  '1xbet', 'betway', 'pinnacle', 'bet365', 'williamhill', 'william hill', 'bwin', 'unibet',
+  'betfair exchange', 'betfair', 'marathonbet', 'betsson',
+  'nordicbet', 'parimatch',
 ]
 
 export async function fetchOddsForFixtures(
@@ -644,10 +698,10 @@ export async function fetchRecentFixtures(
   last = 10
 ): Promise<RecentFixture[]> {
   // Inner helper: fetch for a specific season year
-  async function fetchForSeason(seasonYear: number): Promise<RecentFixture[] | null> {
+async function fetchForSeason(seasonYear: number): Promise<RecentFixture[] | null> {
     const raw = await apiFetch<ApiFootballFixture[]>(
       apiKey,
-      `/fixtures?team=${teamId}&league=${leagueId}&season=${seasonYear}&last=${last}&status=FT`
+      `/fixtures?team=${teamId}&league=${leagueId}&season=${seasonYear}&status=FT`
     )
     // null means rate-limited or error — propagate as null so caller can skip
     if (raw === null) return null
@@ -655,8 +709,13 @@ export async function fetchRecentFixtures(
     if (raw.length === 0) return []
 
     return raw
-      .filter((f) => f.goals.home !== null && f.goals.away !== null)
+      .filter((f) => 
+        f.fixture.status.short === 'FT' &&
+        f.goals.home !== null && 
+        f.goals.away !== null
+      )
       .sort((a, b) => new Date(b.fixture.date).getTime() - new Date(a.fixture.date).getTime())
+      .slice(0, 10)
       .map((f) => {
         const isHome = f.teams.home.id === teamId
         return {

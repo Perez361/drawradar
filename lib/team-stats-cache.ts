@@ -213,10 +213,10 @@ export async function getFormStatsBatch(
     apiCallsUsed++
 
     if (recentFixtures.length === 0) {
-      // Either rate-limited or genuinely no data — log and continue, do NOT abort
+      // Free plan fallback now uses full season — log distinctly
       console.log(
         `[form-stats] no recent fixtures for team ${teamId} ` +
-        `(rate-limited or no data for season ${season}/${season - 1})`
+        `(using season fallback: no FT data in ${season}/${season - 1})`
       )
       continue
     }
